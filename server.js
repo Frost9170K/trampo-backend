@@ -262,10 +262,9 @@ app.post('/pedidos', autenticar, async (req, res) => {
     .from('servicos').select('preco').eq('id', servico_id).single();
   if (!servico) return res.status(404).json({ erro: 'Serviço não encontrado.' });
 
- const valor_servico   = servico.preco;
-const taxa_plataforma = parseFloat((valor_servico * 0.10).toFixed(2));
-const valor_total     = valor_servico; // cliente paga só o preço do serviço
-const valor_autonomo  = parseFloat((valor_servico - taxa_plataforma).toFixed(2));
+  const valor_servico   = servico.preco;
+  const taxa_plataforma = parseFloat((valor_servico * 0.10).toFixed(2));
+  const valor_total     = valor_servico; // cliente paga o preço cheio, taxa sai do autônomo
 
   const { data, error } = await supabase.from('pedidos').insert([{
     usuario_id:  req.usuario.id,
