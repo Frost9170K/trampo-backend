@@ -385,6 +385,75 @@ app.get('/categorias', async (req, res) => {
   res.json(categorias.map(c => ({ ...c, total: contagem[c.nome] || 0 })));
 });
 
+// ════════════════════════════════════════════════════════
+//  CHAT
+// ════════════════════════════════════════════════════════
+app.post('/mensagens', autenticar, async (req, res) => {
+  const { para_id, para_tipo, texto, pedido_id } = req.body;
+  if (!para_id || !para_tipo || !texto?.trim())
+    return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
+
+  const { data, error } = await supabase.from('mensagens').insert([{
+    de_id:    req.usuario.id,
+    de_tipo:  req.usuario.tipo,
+    para_id,
+    para_tipo,
+    texto:    texto.trim(),
+    pedido_id: pedido_id || null,
+  }]).select();
+
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(201).json({ mensagem: data[0] });
+});
+
+app.get('/mensagens/:outro_id', autenticar, async (req, res) => {
+  const meuId   = req.usuario.id;
+  const outroId = req.params.outro_id;
+
+  const { data, error } = await supabase
+    .from('mensagens')
+    .select('*')
+    .or(`and(de_id.eq.${meuId},para_id.eq.${outroId}),and(de_id.eq.${outroId},para_id.eq.${meuId})`)
+    .order('criado_em', { ascending: true });
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  await supabase.from('mensagens')
+    .update({ lida: true })
+    .eq('para_id', meuId)
+    .eq('de_id', outroId);
+
+  res.json(data);
+});
+
+app.get('/conversas', autenticar, async (req, res) => {
+  const meuId = req.usuario.id;
+  const { data, error } = await supabase
+    .from('mensagens')
+    .select('*')
+    .or(`de_id.eq.${meuId},para_id.eq.${meuId}`)
+    .order('criado_em', { ascending: false });
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  const conversas = {};
+  (data || []).forEach(m => {
+    const outroId = m.de_id === meuId ? m.para_id : m.de_id;
+    if (!conversas[outroId]) conversas[outroId] = m;
+  });
+
+  res.json(Object.values(conversas));
+});
+
+app.get('/mensagens/nao-lidas/count', autenticar, async (req, res) => {
+  const { count } = await supabase
+    .from('mensagens')
+    .select('*', { count: 'exact', head: true })
+    .eq('para_id', req.usuario.id)
+    .eq('lida', false);
+  res.json({ total: count || 0 });
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
