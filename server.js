@@ -50,7 +50,7 @@ app.post('/pre-cadastro', async (req, res) => {
                bio, como_soube }])
     .select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.status(201).json({ mensagem: 'Pré-cadastro realizado!', id: data[0].id });
 });
 
@@ -85,7 +85,7 @@ app.post('/autonomos/cadastro', async (req, res) => {
                disponibilidade, lat, lng, localizacao }])
     .select('id, nome, email, categoria');
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
 
   const token = jwt.sign(
     { id: data[0].id, tipo: 'autonomo' },
@@ -130,7 +130,7 @@ app.get('/autonomos', async (req, res) => {
       raio_km:          parseFloat(raio),
       categoria_filtro: categoria || null
     });
-    if (error) return res.status(500).json({ erro: error.message });
+    if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
     return res.json(data);
   }
 
@@ -145,7 +145,7 @@ app.get('/autonomos', async (req, res) => {
   if (busca)     query = query.ilike('nome', `%${busca}%`);
 
   const { data, error } = await query;
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.json(data);
 });
 
@@ -177,7 +177,7 @@ app.get('/autonomos/painel/dados', autenticar, async (req, res) => {
     .eq('id', req.usuario.id)
     .single();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   const { senha_hash, ...semSenha } = data;
   res.json(semSenha);
 });
@@ -214,7 +214,7 @@ app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
   const { data, error } = await supabase
     .from('autonomos').update(update).eq('id', req.usuario.id).select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.json({ mensagem: 'Perfil atualizado!', autonomo: data[0] });
 });
 
@@ -233,7 +233,7 @@ app.post('/usuarios/cadastro', async (req, res) => {
   const { data, error } = await supabase
     .from('usuarios').insert([{ nome, email, senha_hash, telefone }]).select('id, nome, email');
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
 
   const token = jwt.sign({ id: data[0].id, tipo: 'usuario' }, process.env.JWT_SECRET, { expiresIn: '30d' });
   res.status(201).json({ usuario: data[0], token });
@@ -273,7 +273,7 @@ app.post('/pedidos', autenticar, async (req, res) => {
     valor_servico, taxa_plataforma, valor_total
   }]).select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.status(201).json({ pedido: data[0] });
 });
 
@@ -294,7 +294,7 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
   // Incrementa contador de serviços do autônomo
   await supabase.rpc('incrementar_servicos', { autonomo_id: pedido.autonomo_id });
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.json({ mensagem: 'Serviço concluído! Pagamento liberado.', pedido: data[0] });
 });
 
@@ -307,7 +307,7 @@ app.get('/pedidos', autenticar, async (req, res) => {
     .eq(campo, req.usuario.id)
     .order('criado_em', { ascending: false });
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.json(data);
 });
 
@@ -330,7 +330,7 @@ app.post('/avaliacoes', autenticar, async (req, res) => {
     autonomo_id: pedido.autonomo_id
   }]).select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.status(201).json({ avaliacao: data[0] });
 });
 
@@ -346,7 +346,7 @@ app.post('/servicos', autenticar, async (req, res) => {
     preco: parseFloat(preco), unidade: unidade || 'serviço'
   }]).select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.status(201).json({ servico: data[0] });
 });
 
@@ -354,7 +354,7 @@ app.delete('/servicos/:id', autenticar, async (req, res) => {
   const { error } = await supabase
     .from('servicos').delete()
     .eq('id', req.params.id).eq('autonomo_id', req.usuario.id);
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.json({ mensagem: 'Serviço removido.' });
 });
 
@@ -402,7 +402,7 @@ app.post('/mensagens', autenticar, async (req, res) => {
     pedido_id: pedido_id || null,
   }]).select();
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
   res.status(201).json({ mensagem: data[0] });
 });
 
@@ -416,7 +416,7 @@ app.get('/mensagens/:outro_id', autenticar, async (req, res) => {
     .or(`and(de_id.eq.${meuId},para_id.eq.${outroId}),and(de_id.eq.${outroId},para_id.eq.${meuId})`)
     .order('criado_em', { ascending: true });
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
 
   await supabase.from('mensagens')
     .update({ lida: true })
@@ -434,7 +434,7 @@ app.get('/conversas', autenticar, async (req, res) => {
     .or(`de_id.eq.${meuId},para_id.eq.${meuId}`)
     .order('criado_em', { ascending: false });
 
-  if (error) return res.status(500).json({ erro: error.message });
+  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
 
   const conversas = {};
   (data || []).forEach(m => {
