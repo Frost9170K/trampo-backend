@@ -395,7 +395,7 @@ app.post('/mensagens', autenticar, async (req, res) => {
 
   const { data, error } = await supabase.from('mensagens').insert([{
     de_id:    req.usuario.id,
-    de_tipo:  req.usuario.tipo,
+    de_tipo: req.usuario.tipo === 'autonomo' ? 'autonomo' : 'usuario',
     para_id,
     para_tipo,
     texto:    texto.trim(),
