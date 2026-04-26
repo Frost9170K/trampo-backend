@@ -50,7 +50,7 @@ app.post('/pre-cadastro', async (req, res) => {
                bio, como_soube }])
     .select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ mensagem: 'Pré-cadastro realizado!', id: data[0].id });
 });
 
@@ -85,7 +85,7 @@ app.post('/autonomos/cadastro', async (req, res) => {
                disponibilidade, lat, lng, localizacao }])
     .select('id, nome, email, categoria');
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
 
   const token = jwt.sign(
     { id: data[0].id, tipo: 'autonomo' },
@@ -130,7 +130,7 @@ app.get('/autonomos', async (req, res) => {
       raio_km:          parseFloat(raio),
       categoria_filtro: categoria || null
     });
-    if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+    if (error) return res.status(500).json({ erro: error.message });
     return res.json(data);
   }
 
@@ -145,7 +145,7 @@ app.get('/autonomos', async (req, res) => {
   if (busca)     query = query.ilike('nome', `%${busca}%`);
 
   const { data, error } = await query;
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.json(data);
 });
 
@@ -177,7 +177,7 @@ app.get('/autonomos/painel/dados', autenticar, async (req, res) => {
     .eq('id', req.usuario.id)
     .single();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   const { senha_hash, ...semSenha } = data;
   res.json(semSenha);
 });
@@ -214,7 +214,7 @@ app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
   const { data, error } = await supabase
     .from('autonomos').update(update).eq('id', req.usuario.id).select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Perfil atualizado!', autonomo: data[0] });
 });
 
@@ -233,7 +233,7 @@ app.post('/usuarios/cadastro', async (req, res) => {
   const { data, error } = await supabase
     .from('usuarios').insert([{ nome, email, senha_hash, telefone }]).select('id, nome, email');
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
 
   const token = jwt.sign({ id: data[0].id, tipo: 'usuario' }, process.env.JWT_SECRET, { expiresIn: '30d' });
   res.status(201).json({ usuario: data[0], token });
@@ -273,7 +273,7 @@ app.post('/pedidos', autenticar, async (req, res) => {
     valor_servico, taxa_plataforma, valor_total
   }]).select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ pedido: data[0] });
 });
 
@@ -294,7 +294,7 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
   // Incrementa contador de serviços do autônomo
   await supabase.rpc('incrementar_servicos', { autonomo_id: pedido.autonomo_id });
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Serviço concluído! Pagamento liberado.', pedido: data[0] });
 });
 
@@ -307,7 +307,7 @@ app.get('/pedidos', autenticar, async (req, res) => {
     .eq(campo, req.usuario.id)
     .order('criado_em', { ascending: false });
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.json(data);
 });
 
@@ -330,7 +330,7 @@ app.post('/avaliacoes', autenticar, async (req, res) => {
     autonomo_id: pedido.autonomo_id
   }]).select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ avaliacao: data[0] });
 });
 
@@ -346,7 +346,7 @@ app.post('/servicos', autenticar, async (req, res) => {
     preco: parseFloat(preco), unidade: unidade || 'serviço'
   }]).select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ servico: data[0] });
 });
 
@@ -354,7 +354,7 @@ app.delete('/servicos/:id', autenticar, async (req, res) => {
   const { error } = await supabase
     .from('servicos').delete()
     .eq('id', req.params.id).eq('autonomo_id', req.usuario.id);
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Serviço removido.' });
 });
 
@@ -395,14 +395,14 @@ app.post('/mensagens', autenticar, async (req, res) => {
 
   const { data, error } = await supabase.from('mensagens').insert([{
     de_id:    req.usuario.id,
-    de_tipo: req.usuario.tipo === 'autonomo' ? 'autonomo' : 'usuario',
+    de_tipo:  req.usuario.tipo,
     para_id,
     para_tipo,
     texto:    texto.trim(),
     pedido_id: pedido_id || null,
   }]).select();
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ mensagem: data[0] });
 });
 
@@ -416,7 +416,7 @@ app.get('/mensagens/:outro_id', autenticar, async (req, res) => {
     .or(`and(de_id.eq.${meuId},para_id.eq.${outroId}),and(de_id.eq.${outroId},para_id.eq.${meuId})`)
     .order('criado_em', { ascending: true });
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
 
   await supabase.from('mensagens')
     .update({ lida: true })
@@ -434,7 +434,7 @@ app.get('/conversas', autenticar, async (req, res) => {
     .or(`de_id.eq.${meuId},para_id.eq.${meuId}`)
     .order('criado_em', { ascending: false });
 
-  if (error) {   console.log('ERRO CHAT:', JSON.stringify(error));   return res.status(500).json({ erro: error.message, detalhes: error }); }
+  if (error) return res.status(500).json({ erro: error.message });
 
   const conversas = {};
   (data || []).forEach(m => {
@@ -452,6 +452,77 @@ app.get('/mensagens/nao-lidas/count', autenticar, async (req, res) => {
     .eq('para_id', req.usuario.id)
     .eq('lida', false);
   res.json({ total: count || 0 });
+});
+
+
+// ════════════════════════════════════════════════════════
+//  RECUPERAÇÃO DE SENHA
+// ════════════════════════════════════════════════════════
+app.post('/recuperar-senha', async (req, res) => {
+  const { email, tipo } = req.body;
+  if (!email) return res.status(400).json({ erro: 'Email obrigatório.' });
+  const tabela = tipo === 'autonomo' ? 'autonomos' : 'usuarios';
+  const { data } = await supabase.from(tabela).select('id, nome, email').eq('email', email).single();
+  if (!data) return res.json({ mensagem: 'Se o email existir, você receberá as instruções.' });
+  const token = jwt.sign(
+    { id: data.id, tipo: tipo||'usuario', acao: 'recuperar_senha' },
+    process.env.JWT_SECRET, { expiresIn: '1h' }
+  );
+  res.json({ mensagem: 'Instruções enviadas!', token_dev: token });
+});
+
+app.post('/redefinir-senha', async (req, res) => {
+  const { token, nova_senha } = req.body;
+  if (!token || !nova_senha) return res.status(400).json({ erro: 'Token e nova senha obrigatórios.' });
+  if (nova_senha.length < 6) return res.status(400).json({ erro: 'Mínimo 6 caracteres.' });
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.acao !== 'recuperar_senha') throw new Error();
+    const tabela = payload.tipo === 'autonomo' ? 'autonomos' : 'usuarios';
+    const senha_hash = await bcrypt.hash(nova_senha, 10);
+    await supabase.from(tabela).update({ senha_hash }).eq('id', payload.id);
+    res.json({ mensagem: 'Senha redefinida com sucesso!' });
+  } catch { res.status(400).json({ erro: 'Token inválido ou expirado.' }); }
+});
+
+// ════════════════════════════════════════════════════════
+//  CONVERTER PRÉ-CADASTRO
+// ════════════════════════════════════════════════════════
+app.get('/pre-cadastros/verificar/:email', async (req, res) => {
+  const { data } = await supabase.from('pre_cadastros')
+    .select('*').eq('email', req.params.email).eq('convertido', false).single();
+  if (!data) return res.json({ encontrado: false });
+  res.json({ encontrado: true, dados: data });
+});
+
+app.post('/pre-cadastros/converter/:id', async (req, res) => {
+  const { autonomo_id } = req.body;
+  if (!autonomo_id) return res.status(400).json({ erro: 'ID obrigatório.' });
+  const { data: pre } = await supabase.from('pre_cadastros').select('*').eq('id', req.params.id).single();
+  if (!pre) return res.status(404).json({ erro: 'Não encontrado.' });
+  const update = {};
+  if (pre.especialidade)  update.especialidade  = pre.especialidade;
+  if (pre.bio)            update.bio            = pre.bio;
+  if (pre.preco_medio)    update.preco_medio    = pre.preco_medio;
+  if (pre.disponibilidade)update.disponibilidade= pre.disponibilidade;
+  await supabase.from('autonomos').update(update).eq('id', autonomo_id);
+  await supabase.from('pre_cadastros').update({ convertido: true }).eq('id', pre.id);
+  res.json({ mensagem: 'Perfil importado!', dados: update });
+});
+
+// ════════════════════════════════════════════════════════
+//  DENÚNCIAS
+// ════════════════════════════════════════════════════════
+app.post('/denuncias', autenticar, async (req, res) => {
+  const { denunciado_id, denunciado_tipo, motivo, descricao } = req.body;
+  if (!denunciado_id || !motivo) return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
+  const { data, error } = await supabase.from('denuncias').insert([{
+    denunciante_id:   req.usuario.id,
+    denunciante_tipo: req.usuario.tipo,
+    denunciado_id, denunciado_tipo, motivo, descricao,
+  }]).select();
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(201).json({ mensagem: 'Denúncia registrada. Analisaremos em até 48h.', id: data[0].id });
 });
 
 // ── Health check ──────────────────────────────────────────
