@@ -524,7 +524,13 @@ app.post('/denuncias', autenticar, async (req, res) => {
   if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ mensagem: 'Denúncia registrada. Analisaremos em até 48h.', id: data[0].id });
 });
-
+app.post('/push-token', autenticar, async (req, res) => {
+  const { push_token } = req.body;
+  if (!push_token) return res.status(400).json({ erro: 'Token obrigatório.' });
+  const tabela = req.usuario.tipo === 'autonomo' ? 'autonomos' : 'usuarios';
+  await supabase.from(tabela).update({ push_token }).eq('id', req.usuario.id);
+  res.json({ mensagem: 'Token salvo!' });
+});
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
