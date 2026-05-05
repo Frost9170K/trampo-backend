@@ -744,6 +744,17 @@ app.patch('/pedidos/:id/cancelar', autenticar, async (req, res) => {
   res.json({ mensagem: 'Pedido cancelado.' });
 });
 
+
+app.get('/avaliacoes/minhas', autenticar, async (req, res) => {
+  const { data, error } = await supabase
+    .from('avaliacoes')
+    .select('nota, comentario, criado_em, usuarios(nome)')
+    .eq('autonomo_id', req.usuario.id)
+    .order('criado_em', { ascending: false });
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json(data);
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
