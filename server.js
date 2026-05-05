@@ -303,7 +303,7 @@ app.get('/pedidos', autenticar, async (req, res) => {
   const campo = req.usuario.tipo === 'autonomo' ? 'autonomo_id' : 'usuario_id';
   const { data, error } = await supabase
     .from('pedidos')
-    .select('*, servicos(nome), autonomos(nome), usuarios(nome)')
+    .select('*, servicos(nome), autonomos(nome, especialidade, categoria), usuarios(nome), avaliacoes(nota, comentario)')
     .eq(campo, req.usuario.id)
     .order('criado_em', { ascending: false });
 
