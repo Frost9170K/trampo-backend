@@ -524,13 +524,147 @@ app.post('/denuncias', autenticar, async (req, res) => {
   if (error) return res.status(500).json({ erro: error.message });
   res.status(201).json({ mensagem: 'Denúncia registrada. Analisaremos em até 48h.', id: data[0].id });
 });
-app.post('/push-token', autenticar, async (req, res) => {
-  const { push_token } = req.body;
-  if (!push_token) return res.status(400).json({ erro: 'Token obrigatório.' });
-  const tabela = req.usuario.tipo === 'autonomo' ? 'autonomos' : 'usuarios';
-  await supabase.from(tabela).update({ push_token }).eq('id', req.usuario.id);
-  res.json({ mensagem: 'Token salvo!' });
+
+
+// ════════════════════════════════════════════════════════
+//  PAGAR.ME
+// ════════════════════════════════════════════════════════
+
+app.post('/pagamentos/pix', autenticar, async (req, res) => {
+  const { pedido_id } = req.body;
+  if (!pedido_id) return res.status(400).json({ erro: 'pedido_id obrigatorio.' });
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, usuarios(*), servicos(*)')
+    .eq('id', pedido_id).single();
+
+  if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+
+  try {
+    const tel = (pedido.usuarios.telefone || '51999999999').replace(/[^0-9]/g, '').slice(-9);
+    const resp = await fetch('https://api.pagar.me/core/v5/orders', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(process.env.PAGARME_SECRET_KEY + ':').toString('base64'),
+      },
+      body: JSON.stringify({
+        code: pedido_id,
+        customer: {
+          name:  pedido.usuarios.nome,
+          email: pedido.usuarios.email,
+          type:  'individual',
+          document: '00000000000',
+          phones: { mobile_phone: { country_code: '55', area_code: '51', number: tel } }
+        },
+        items: [{
+          amount:      Math.round(pedido.valor_total * 100),
+          description: pedido.servicos?.nome || 'Servico Trampo',
+          quantity:    1,
+          code:        pedido.servico_id || 'servico',
+        }],
+        payments: [{ payment_method: 'pix', pix: { expires_in: 3600 } }]
+      })
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(JSON.stringify(data));
+
+    const charge = data.charges?.[0];
+    const pix    = charge?.last_transaction;
+
+    await supabase.from('pedidos').update({
+      pagarme_order_id:  data.id,
+      pagarme_charge_id: charge?.id,
+    }).eq('id', pedido_id);
+
+    res.json({
+      order_id:       data.id,
+      pix_qrcode:     pix?.qr_code,
+      pix_qrcode_url: pix?.qr_code_url,
+      expires_at:     pix?.expires_at,
+      valor:          pedido.valor_total,
+    });
+
+  } catch(e) {
+    console.error('Erro Pagar.me PIX:', e.message);
+    res.status(500).json({ erro: 'Erro ao criar cobranca Pix.', detalhes: e.message });
+  }
 });
+
+app.post('/pagamentos/webhook', async (req, res) => {
+  const { type, data } = req.body;
+  console.log('Webhook Pagar.me:', type);
+  if (type === 'charge.paid') {
+    const orderId = data?.order?.id || data?.order_id;
+    if (orderId) {
+      await supabase.from('pedidos')
+        .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
+        .eq('pagarme_order_id', orderId);
+    }
+  }
+  res.json({ ok: true });
+});
+
+app.get('/pagamentos/status/:pedido_id', autenticar, async (req, res) => {
+  const { data: pedido } = await supabase
+    .from('pedidos').select('status, pagarme_order_id, pago_em')
+    .eq('id', req.params.pedido_id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+  res.json({ status: pedido.status, pago_em: pedido.pago_em });
+});
+
+// ════════════════════════════════════════════════════════
+//  ORCAMENTOS
+// ════════════════════════════════════════════════════════
+
+app.post('/orcamentos', autenticar, async (req, res) => {
+  const { autonomo_id, descricao, categoria } = req.body;
+  if (!autonomo_id || !descricao) return res.status(400).json({ erro: 'Campos obrigatorios faltando.' });
+  const { data, error } = await supabase.from('orcamentos').insert([{
+    usuario_id: req.usuario.id, autonomo_id, descricao, categoria,
+    status: 'aguardando_resposta',
+  }]).select();
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(201).json({ orcamento: data[0] });
+});
+
+app.patch('/orcamentos/:id/responder', autenticar, async (req, res) => {
+  const { valor, prazo, observacao } = req.body;
+  if (!valor) return res.status(400).json({ erro: 'Valor obrigatorio.' });
+  const { data, error } = await supabase.from('orcamentos')
+    .update({ valor, prazo, observacao, status: 'respondido', respondido_em: new Date().toISOString() })
+    .eq('id', req.params.id).eq('autonomo_id', req.usuario.id).select();
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json({ orcamento: data[0] });
+});
+
+app.post('/orcamentos/:id/aprovar', autenticar, async (req, res) => {
+  const { data: orc } = await supabase.from('orcamentos').select('*').eq('id', req.params.id).single();
+  if (!orc) return res.status(404).json({ erro: 'Orcamento nao encontrado.' });
+  if (orc.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissao.' });
+  const valor_servico   = orc.valor;
+  const taxa_plataforma = parseFloat((valor_servico * 0.10).toFixed(2));
+  const { data: pedido, error } = await supabase.from('pedidos').insert([{
+    usuario_id: req.usuario.id, autonomo_id: orc.autonomo_id,
+    descricao: orc.descricao, valor_servico, taxa_plataforma,
+    valor_total: valor_servico, status: 'aguardando_pagamento',
+  }]).select();
+  if (error) return res.status(500).json({ erro: error.message });
+  await supabase.from('orcamentos').update({ status: 'aprovado', pedido_id: pedido[0].id }).eq('id', orc.id);
+  res.status(201).json({ pedido: pedido[0] });
+});
+
+app.get('/orcamentos', autenticar, async (req, res) => {
+  const campo = req.usuario.tipo === 'autonomo' ? 'autonomo_id' : 'usuario_id';
+  const { data, error } = await supabase.from('orcamentos')
+    .select('*, usuarios(nome), autonomos(nome, especialidade)')
+    .eq(campo, req.usuario.id)
+    .order('criado_em', { ascending: false });
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json(data);
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
