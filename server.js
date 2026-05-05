@@ -207,7 +207,7 @@ app.get('/autonomos/painel/metricas', autenticar, async (req, res) => {
 
 // ── Atualizar perfil do autônomo ──────────────────────────
 app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
-  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo'];
+  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix'];
   const update = {};
   campos.forEach(c => { if (req.body[c] !== undefined) update[c] = req.body[c]; });
 
@@ -295,6 +295,46 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
   await supabase.rpc('incrementar_servicos', { autonomo_id: pedido.autonomo_id });
 
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Transferir automaticamente pro autônomo via Pix
+  try {
+    const { data: autonomo } = await supabase
+      .from('autonomos').select('chave_pix, nome').eq('id', pedido.autonomo_id).single();
+
+    if (autonomo?.chave_pix && process.env.MP_ACCESS_TOKEN) {
+      const valorAutonomo = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
+      
+      // Detectar tipo da chave pix
+      const chave = autonomo.chave_pix.trim();
+      let tipoChave = 'email';
+      if (/^\d{11}$/.test(chave.replace(/\D/g,''))) tipoChave = 'cpf';
+      else if (/^\d{10,11}$/.test(chave.replace(/\D/g,''))) tipoChave = 'phone';
+      else if (/^\d{14}$/.test(chave.replace(/\D/g,''))) tipoChave = 'cnpj';
+
+      await fetch('https://api.mercadopago.com/v1/advanced_payments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+          'X-Idempotency-Key': `transferencia-${pedido.id}`,
+        },
+        body: JSON.stringify({
+          payer: { type: 'customer', email: 'trampo@trampo.app' },
+          payments: [{ payment_method_id: 'account_money', amount: valorAutonomo }],
+          disbursements: [{
+            amount: valorAutonomo,
+            external_reference: `pedido-${pedido.id}`,
+            receiver: { id: chave },
+            money_release_days: 1,
+          }],
+        })
+      });
+      console.log(`Transferência iniciada: R$${valorAutonomo} → ${autonomo.nome} (${chave})`);
+    }
+  } catch(e) {
+    console.log('Transferência manual necessária:', e.message);
+  }
+
   res.json({ mensagem: 'Serviço concluído! Pagamento liberado.', pedido: data[0] });
 });
 
