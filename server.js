@@ -527,7 +527,7 @@ app.post('/denuncias', autenticar, async (req, res) => {
 
 
 // ════════════════════════════════════════════════════════
-//  PAGAR.ME
+//  MERCADO PAGO
 // ════════════════════════════════════════════════════════
 
 app.post('/pagamentos/pix', autenticar, async (req, res) => {
@@ -541,67 +541,75 @@ app.post('/pagamentos/pix', autenticar, async (req, res) => {
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
 
   try {
-    const tel = (pedido.usuarios.telefone || '51999999999').replace(/[^0-9]/g, '').slice(-9);
-    const resp = await fetch('https://api.pagar.me/core/v5/orders', {
+    const idempotencia = `trampo-${pedido_id}-${Date.now()}`;
+
+    const resp = await fetch('https://api.mercadopago.com/v1/payments', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + Buffer.from(process.env.PAGARME_SECRET_KEY + ':').toString('base64'),
+        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+        'X-Idempotency-Key': idempotencia,
       },
       body: JSON.stringify({
-        code: pedido_id,
-        customer: {
-          name:  pedido.usuarios.nome,
+        transaction_amount: parseFloat(pedido.valor_total),
+        description: pedido.servicos?.nome || 'Servico Trampo',
+        payment_method_id: 'pix',
+        payer: {
           email: pedido.usuarios.email,
-          type:  'individual',
-          document: '00000000000',
-          phones: { mobile_phone: { country_code: '55', area_code: '51', number: tel } }
+          first_name: pedido.usuarios.nome?.split(' ')[0] || 'Cliente',
+          last_name:  pedido.usuarios.nome?.split(' ').slice(1).join(' ') || 'Trampo',
         },
-        items: [{
-          amount:      Math.round(pedido.valor_total * 100),
-          description: pedido.servicos?.nome || 'Servico Trampo',
-          quantity:    1,
-          code:        pedido.servico_id || 'servico',
-        }],
-        payments: [{ payment_method: 'pix', pix: { expires_in: 3600 } }]
+        notification_url: `${process.env.API_URL || 'https://web-production-8a9e5.up.railway.app'}/pagamentos/webhook`,
+        metadata: { pedido_id },
       })
     });
 
     const data = await resp.json();
     if (!resp.ok) throw new Error(JSON.stringify(data));
 
-    const charge = data.charges?.[0];
-    const pix    = charge?.last_transaction;
+    const pix = data.point_of_interaction?.transaction_data;
 
     await supabase.from('pedidos').update({
-      pagarme_order_id:  data.id,
-      pagarme_charge_id: charge?.id,
+      pagarme_order_id: String(data.id),
+      status: 'aguardando_pagamento'
     }).eq('id', pedido_id);
 
     res.json({
       order_id:       data.id,
       pix_qrcode:     pix?.qr_code,
-      pix_qrcode_url: pix?.qr_code_url,
-      expires_at:     pix?.expires_at,
+      pix_qrcode_url: pix?.qr_code_url || pix?.ticket_url,
+      expires_at:     data.date_of_expiration,
       valor:          pedido.valor_total,
+      status:         data.status,
     });
 
   } catch(e) {
-    console.error('Erro Pagar.me PIX:', e.message);
+    console.error('Erro MP PIX:', e.message);
     res.status(500).json({ erro: 'Erro ao criar cobranca Pix.', detalhes: e.message });
   }
 });
 
 app.post('/pagamentos/webhook', async (req, res) => {
   const { type, data } = req.body;
-  console.log('Webhook Pagar.me:', type);
-  if (type === 'charge.paid') {
-    const orderId = data?.order?.id || data?.order_id;
-    if (orderId) {
-      await supabase.from('pedidos')
-        .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
-        .eq('pagarme_order_id', orderId);
-    }
+  console.log('Webhook MP:', type, data?.id);
+
+  if (type === 'payment' && data?.id) {
+    try {
+      const resp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
+        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+      });
+      const payment = await resp.json();
+
+      if (payment.status === 'approved') {
+        const pedidoId = payment.metadata?.pedido_id;
+        if (pedidoId) {
+          await supabase.from('pedidos')
+            .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
+            .eq('id', pedidoId);
+          console.log('Pedido pago:', pedidoId);
+        }
+      }
+    } catch(e) { console.error('Webhook erro:', e.message); }
   }
   res.json({ ok: true });
 });
@@ -611,6 +619,23 @@ app.get('/pagamentos/status/:pedido_id', autenticar, async (req, res) => {
     .from('pedidos').select('status, pagarme_order_id, pago_em')
     .eq('id', req.params.pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+
+  // Verifica status direto no MP se tiver order_id
+  if (pedido.pagarme_order_id && pedido.status === 'aguardando_pagamento') {
+    try {
+      const resp = await fetch(`https://api.mercadopago.com/v1/payments/${pedido.pagarme_order_id}`, {
+        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+      });
+      const payment = await resp.json();
+      if (payment.status === 'approved') {
+        await supabase.from('pedidos')
+          .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
+          .eq('id', req.params.pedido_id);
+        return res.json({ status: 'em_andamento', pago_em: new Date().toISOString() });
+      }
+    } catch {}
+  }
+
   res.json({ status: pedido.status, pago_em: pedido.pago_em });
 });
 
