@@ -690,6 +690,20 @@ app.get('/orcamentos', autenticar, async (req, res) => {
   res.json(data);
 });
 
+
+app.patch('/pedidos/:id/cancelar', autenticar, async (req, res) => {
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (!['aguardando_pagamento'].includes(pedido.status))
+    return res.status(400).json({ erro: 'Só é possível cancelar pedidos aguardando pagamento.' });
+  const { error } = await supabase.from('pedidos')
+    .update({ status: 'cancelado' }).eq('id', req.params.id);
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json({ mensagem: 'Pedido cancelado.' });
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
