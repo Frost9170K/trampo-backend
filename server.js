@@ -755,6 +755,87 @@ app.get('/avaliacoes/minhas', autenticar, async (req, res) => {
   res.json(data);
 });
 
+
+app.post('/pagamentos/cartao', autenticar, async (req, res) => {
+  const { pedido_id, card_number, card_holder_name, card_expiration_month,
+          card_expiration_year, card_cvv, installments, valor_total } = req.body;
+
+  if (!pedido_id || !card_number) return res.status(400).json({ erro: 'Dados incompletos.' });
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, usuarios(*)').eq('id', pedido_id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+
+  try {
+    // 1. Tokenizar o cartão
+    const tokenRes = await fetch('https://api.mercadopago.com/v1/card_tokens', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify({
+        card_number, card_holder_name,
+        card_expiration_month, card_expiration_year,
+        security_code: card_cvv,
+        cardholder: { name: card_holder_name },
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok) throw new Error(tokenData.message || 'Erro ao tokenizar cartão.');
+
+    // 2. Criar pagamento
+    const pagRes = await fetch('https://api.mercadopago.com/v1/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+        'X-Idempotency-Key': `cartao-${pedido_id}-${Date.now()}`,
+      },
+      body: JSON.stringify({
+        transaction_amount: parseFloat(valor_total),
+        token: tokenData.id,
+        description: 'Serviço Trampo',
+        installments: parseInt(installments) || 1,
+        payment_method_id: 'visa', // MP detecta automaticamente
+        payer: {
+          email: pedido.usuarios.email,
+          first_name: pedido.usuarios.nome?.split(' ')[0] || 'Cliente',
+          last_name: pedido.usuarios.nome?.split(' ').slice(1).join(' ') || 'Trampo',
+        },
+        notification_url: `${process.env.API_URL || 'https://web-production-8a9e5.up.railway.app'}/pagamentos/webhook`,
+        metadata: { pedido_id },
+      })
+    });
+
+    const pagData = await pagRes.json();
+    if (!pagRes.ok) throw new Error(pagData.message || 'Erro ao processar pagamento.');
+
+    if (pagData.status === 'approved') {
+      await supabase.from('pedidos').update({
+        pagarme_order_id: String(pagData.id),
+        status: 'em_andamento',
+        pago_em: new Date().toISOString()
+      }).eq('id', pedido_id);
+      return res.json({ status: 'approved', mensagem: 'Pagamento aprovado!' });
+    }
+
+    if (pagData.status === 'in_process' || pagData.status === 'pending') {
+      await supabase.from('pedidos').update({
+        pagarme_order_id: String(pagData.id),
+        status: 'aguardando_pagamento',
+      }).eq('id', pedido_id);
+      return res.json({ status: 'pending', mensagem: 'Pagamento em análise.' });
+    }
+
+    throw new Error(pagData.status_detail || 'Pagamento recusado. Verifique os dados do cartão.');
+
+  } catch(e) {
+    console.error('Erro cartão:', e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
