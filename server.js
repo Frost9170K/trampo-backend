@@ -836,6 +836,17 @@ app.post('/pagamentos/cartao', autenticar, async (req, res) => {
   }
 });
 
+
+app.patch('/orcamentos/:id/recusar', autenticar, async (req, res) => {
+  const { data, error } = await supabase.from('orcamentos')
+    .update({ status: 'recusado' })
+    .eq('id', req.params.id)
+    .eq('usuario_id', req.usuario.id)
+    .select();
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json({ orcamento: data[0] });
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
