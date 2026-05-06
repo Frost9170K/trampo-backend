@@ -35,7 +35,7 @@ function autenticar(req, res, next) {
 //  PRÉ-CADASTRO (formulário de divulgação)
 // ════════════════════════════════════════════════════════
 app.post('/pre-cadastro', async (req, res) => {
-  const { nome, email, telefone, bairro, categoria,
+  const { nome, email, telefone, cidade, bairro, categoria,
           especialidade, preco_medio, disponibilidade,
           bio, como_soube } = req.body;
 
@@ -45,7 +45,7 @@ app.post('/pre-cadastro', async (req, res) => {
 
   const { data, error } = await supabase
     .from('pre_cadastros')
-    .insert([{ nome, email, telefone, bairro, categoria,
+    .insert([{ nome, email, telefone, cidade, bairro, categoria,
                especialidade, preco_medio, disponibilidade,
                bio, como_soube }])
     .select();
