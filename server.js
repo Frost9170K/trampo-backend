@@ -254,7 +254,7 @@ app.post('/usuarios/login', async (req, res) => {
 //  PEDIDOS
 // ════════════════════════════════════════════════════════
 app.post('/pedidos', autenticar, async (req, res) => {
-  const { autonomo_id, servico_id, descricao, data_agendada } = req.body;
+  const { autonomo_id, servico_id, descricao, data_agendada, observacao, metodo_pagamento, data_agendamento, hora_agendamento } = req.body;
   if (!autonomo_id || !servico_id) return res.status(400).json({ erro: 'Dados do serviço obrigatórios.' });
 
   // Busca preço do serviço
@@ -269,7 +269,10 @@ app.post('/pedidos', autenticar, async (req, res) => {
   const { data, error } = await supabase.from('pedidos').insert([{
     usuario_id:  req.usuario.id,
     autonomo_id, servico_id, descricao,
-    data_agendada: data_agendada || null,
+    data_agendada: data_agendamento || data_agendada || null,
+    hora_agendamento: hora_agendamento || null,
+    observacao: observacao || null,
+    metodo_pagamento: metodo_pagamento || 'pix',
     valor_servico, taxa_plataforma, valor_total
   }]).select();
 
@@ -845,6 +848,90 @@ app.patch('/orcamentos/:id/recusar', autenticar, async (req, res) => {
     .select();
   if (error) return res.status(500).json({ erro: error.message });
   res.json({ orcamento: data[0] });
+});
+
+
+// ════════════════════════════════════════════════════════
+//  LIBERAÇÃO AUTOMÁTICA — roda a cada hora
+// ════════════════════════════════════════════════════════
+async function verificarLiberacaoAutomatica() {
+  try {
+    const limite = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const { data: pedidos } = await supabase
+      .from('pedidos')
+      .select('*, autonomos(chave_pix, nome)')
+      .eq('status', 'em_andamento')
+      .lt('pago_em', limite);
+
+    for (const pedido of pedidos || []) {
+      console.log(`Liberando automaticamente pedido ${pedido.id} — 48h sem confirmação`);
+      await supabase.from('pedidos')
+        .update({ status: 'concluido', concluido_em: new Date().toISOString(), liberado_automaticamente: true })
+        .eq('id', pedido.id);
+
+      // Transferir pro autônomo
+      if (pedido.autonomos?.chave_pix && process.env.MP_ACCESS_TOKEN) {
+        const valorAutonomo = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
+        await fetch('https://api.mercadopago.com/v1/payments', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+            'X-Idempotency-Key': `auto-${pedido.id}`,
+          },
+          body: JSON.stringify({
+            transaction_amount: valorAutonomo,
+            description: `Trampo - Pagamento automático #${pedido.id}`,
+            payment_method_id: 'pix',
+            payer: { email: 'pagamento@trampo.app' },
+            point_of_interaction: { linked_to: pedido.autonomos.chave_pix }
+          })
+        }).catch(e => console.log('Erro transferência auto:', e.message));
+      }
+    }
+  } catch(e) {
+    console.error('Erro liberação automática:', e.message);
+  }
+}
+
+// Rodar a cada hora
+setInterval(verificarLiberacaoAutomatica, 60 * 60 * 1000);
+
+// 2. Rota de disputa — autônomo abre disputa se cliente não confirmar
+app.post('/pedidos/:id/disputa', autenticar, async (req, res) => {
+  const { motivo } = req.body;
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*').eq('id', req.params.id).single();
+
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.autonomo_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (pedido.status !== 'em_andamento') return res.status(400).json({ erro: 'Só é possível abrir disputa em pedidos em andamento.' });
+
+  await supabase.from('pedidos').update({
+    status: 'em_disputa',
+    disputa_motivo: motivo || 'Serviço concluído sem confirmação do cliente.',
+    disputa_em: new Date().toISOString()
+  }).eq('id', req.params.id);
+
+  res.json({ mensagem: 'Disputa aberta. Analisaremos em até 24h.' });
+});
+
+// 3. Admin libera pagamento (você mesmo via API)
+app.post('/admin/liberar/:pedido_id', async (req, res) => {
+  const { senha } = req.body;
+  if (senha !== process.env.ADMIN_SECRET) return res.status(403).json({ erro: 'Sem permissão.' });
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, autonomos(chave_pix, nome)').eq('id', req.params.pedido_id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+
+  await supabase.from('pedidos').update({
+    status: 'concluido',
+    concluido_em: new Date().toISOString(),
+    liberado_admin: true
+  }).eq('id', req.params.pedido_id);
+
+  res.json({ mensagem: `Pedido ${req.params.pedido_id} liberado pelo admin.` });
 });
 
 // ── Health check ──────────────────────────────────────────
