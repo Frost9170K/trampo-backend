@@ -944,6 +944,16 @@ app.patch('/usuarios/atualizar-cpf', autenticar, async (req, res) => {
   res.json({ mensagem: 'CPF atualizado!' });
 });
 
+
+app.put('/usuarios/perfil', autenticar, async (req, res) => {
+  const { nome, telefone } = req.body;
+  const { error } = await supabase.from('usuarios')
+    .update({ nome, telefone })
+    .eq('id', req.usuario.id);
+  if (error) return res.status(500).json({ erro: error.message });
+  res.json({ mensagem: 'Perfil atualizado!' });
+});
+
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
 
