@@ -299,43 +299,15 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
 
   if (error) return res.status(500).json({ erro: error.message });
 
-  // Transferir automaticamente pro autônomo via Pix
+  // Transferir automaticamente pro autônomo via Asaas
   try {
     const { data: autonomo } = await supabase
       .from('autonomos').select('chave_pix, nome').eq('id', pedido.autonomo_id).single();
-
-    if (autonomo?.chave_pix && process.env.MP_ACCESS_TOKEN) {
-      const valorAutonomo = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
-      
-      // Detectar tipo da chave pix
-      const chave = autonomo.chave_pix.trim();
-      let tipoChave = 'email';
-      if (/^\d{11}$/.test(chave.replace(/\D/g,''))) tipoChave = 'cpf';
-      else if (/^\d{10,11}$/.test(chave.replace(/\D/g,''))) tipoChave = 'phone';
-      else if (/^\d{14}$/.test(chave.replace(/\D/g,''))) tipoChave = 'cnpj';
-
-      await fetch('https://api.mercadopago.com/v1/advanced_payments', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-          'X-Idempotency-Key': `transferencia-${pedido.id}`,
-        },
-        body: JSON.stringify({
-          payer: { type: 'customer', email: 'trampo@trampo.app' },
-          payments: [{ payment_method_id: 'account_money', amount: valorAutonomo }],
-          disbursements: [{
-            amount: valorAutonomo,
-            external_reference: `pedido-${pedido.id}`,
-            receiver: { id: chave },
-            money_release_days: 1,
-          }],
-        })
-      });
-      console.log(`Transferência iniciada: R$${valorAutonomo} → ${autonomo.nome} (${chave})`);
+    if (autonomo) {
+      await transferirAutonomo({ ...pedido, autonomos: autonomo });
     }
   } catch(e) {
-    console.log('Transferência manual necessária:', e.message);
+    console.log('Erro transferência:', e.message);
   }
 
   res.json({ mensagem: 'Serviço concluído! Pagamento liberado.', pedido: data[0] });
@@ -569,120 +541,146 @@ app.post('/denuncias', autenticar, async (req, res) => {
 });
 
 
+
 // ════════════════════════════════════════════════════════
-//  MERCADO PAGO
+//  ASAAS — PAGAMENTOS
 // ════════════════════════════════════════════════════════
+
+const ASAAS_URL = 'https://api.asaas.com/v3';
+const ASAAS_KEY = process.env.ASAAS_API_KEY;
+
+async function asaasReq(method, path, body) {
+  const r = await fetch(`${ASAAS_URL}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'access_token': ASAAS_KEY },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.errors?.[0]?.description || JSON.stringify(data));
+  return data;
+}
+
+async function buscarOuCriarCliente(usuario) {
+  try {
+    const busca = await asaasReq('GET', `/customers?email=${encodeURIComponent(usuario.email)}`);
+    if (busca.data?.length > 0) return busca.data[0].id;
+  } catch {}
+  const c = await asaasReq('POST', '/customers', {
+    name: usuario.nome, email: usuario.email,
+    phone: (usuario.telefone || '').replace(/[^0-9]/g, ''),
+    groupName: 'Trampo',
+  });
+  return c.id;
+}
+
+async function transferirAutonomo(pedido) {
+  if (!pedido.autonomos?.chave_pix) return;
+  try {
+    const valor = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
+    await asaasReq('POST', '/transfers', {
+      value: valor,
+      pixAddressKey: pedido.autonomos.chave_pix,
+      description: `Trampo - Pedido ${pedido.id}`,
+    });
+    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome}`);
+  } catch(e) {
+    console.log('Erro transferência Asaas:', e.message);
+  }
+}
 
 app.post('/pagamentos/pix', autenticar, async (req, res) => {
   const { pedido_id } = req.body;
   if (!pedido_id) return res.status(400).json({ erro: 'pedido_id obrigatorio.' });
-
   const { data: pedido } = await supabase
     .from('pedidos').select('*, usuarios(*), servicos(*)')
     .eq('id', pedido_id).single();
-
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
 
   try {
-    const idempotencia = `trampo-${pedido_id}-${Date.now()}`;
-
-    const resp = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-        'X-Idempotency-Key': idempotencia,
-      },
-      body: JSON.stringify({
-        transaction_amount: parseFloat(pedido.valor_total),
-        description: pedido.servicos?.nome || 'Servico Trampo',
-        payment_method_id: 'pix',
-        payer: {
-          email: pedido.usuarios.email,
-          first_name: pedido.usuarios.nome?.split(' ')[0] || 'Cliente',
-          last_name:  pedido.usuarios.nome?.split(' ').slice(1).join(' ') || 'Trampo',
-        },
-        notification_url: `${process.env.API_URL || 'https://web-production-8a9e5.up.railway.app'}/pagamentos/webhook`,
-        metadata: { pedido_id },
-      })
+    const clienteId = await buscarOuCriarCliente(pedido.usuarios);
+    const venc = new Date(Date.now() + 3600000).toISOString().split('T')[0];
+    const cob = await asaasReq('POST', '/payments', {
+      customer: clienteId, billingType: 'PIX',
+      value: parseFloat(pedido.valor_total), dueDate: venc,
+      description: pedido.servicos?.nome || 'Servico Trampo',
+      externalReference: pedido_id,
     });
-
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(JSON.stringify(data));
-
-    const pix = data.point_of_interaction?.transaction_data;
-
-    await supabase.from('pedidos').update({
-      pagarme_order_id: String(data.id),
-      status: 'aguardando_pagamento'
-    }).eq('id', pedido_id);
-
-    res.json({
-      order_id:       data.id,
-      pix_qrcode:     pix?.qr_code,
-      pix_qrcode_url: pix?.qr_code_url || pix?.ticket_url,
-      expires_at:     data.date_of_expiration,
-      valor:          pedido.valor_total,
-      status:         data.status,
-    });
-
+    const qr = await asaasReq('GET', `/payments/${cob.id}/pixQrCode`);
+    await supabase.from('pedidos').update({ pagarme_order_id: cob.id, status: 'aguardando_pagamento' }).eq('id', pedido_id);
+    res.json({ order_id: cob.id, pix_qrcode: qr.payload, pix_qrcode_url: cob.invoiceUrl, valor: pedido.valor_total });
   } catch(e) {
-    console.error('Erro MP PIX:', e.message);
-    res.status(500).json({ erro: 'Erro ao criar cobranca Pix.', detalhes: e.message });
+    console.error('Asaas PIX:', e.message);
+    res.status(500).json({ erro: 'Erro ao criar cobrança Pix.', detalhes: e.message });
+  }
+});
+
+app.post('/pagamentos/cartao', autenticar, async (req, res) => {
+  const { pedido_id, card_number, card_holder_name, card_expiration_month,
+          card_expiration_year, card_cvv, installments, valor_total } = req.body;
+  if (!pedido_id || !card_number) return res.status(400).json({ erro: 'Dados incompletos.' });
+  const { data: pedido } = await supabase.from('pedidos').select('*, usuarios(*)').eq('id', pedido_id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+
+  try {
+    const clienteId = await buscarOuCriarCliente(pedido.usuarios);
+    const parc = parseInt(installments) || 1;
+    const cob = await asaasReq('POST', '/payments', {
+      customer: clienteId, billingType: 'CREDIT_CARD',
+      value: parseFloat(valor_total), dueDate: new Date().toISOString().split('T')[0],
+      description: 'Trampo - Servico', externalReference: pedido_id,
+      installmentCount: parc,
+      installmentValue: parseFloat((valor_total / parc).toFixed(2)),
+      creditCard: {
+        holderName: card_holder_name,
+        number: card_number.replace(/\s/g, ''),
+        expiryMonth: card_expiration_month,
+        expiryYear: card_expiration_year,
+        ccv: card_cvv,
+      },
+      creditCardHolderInfo: {
+        name: pedido.usuarios.nome, email: pedido.usuarios.email,
+        phone: (pedido.usuarios.telefone || '').replace(/[^0-9]/g, ''),
+        postalCode: '90000000', addressNumber: '1',
+      },
+    });
+    if (cob.status === 'CONFIRMED' || cob.status === 'RECEIVED') {
+      await supabase.from('pedidos').update({ pagarme_order_id: cob.id, status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedido_id);
+      return res.json({ status: 'approved', mensagem: 'Pagamento aprovado!' });
+    }
+    throw new Error('Pagamento recusado. Verifique os dados do cartao.');
+  } catch(e) {
+    console.error('Asaas Cartao:', e.message);
+    res.status(500).json({ erro: e.message });
   }
 });
 
 app.post('/pagamentos/webhook', async (req, res) => {
-  const { type, data } = req.body;
-  console.log('Webhook MP:', type, data?.id);
-
-  if (type === 'payment' && data?.id) {
-    try {
-      const resp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
-        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
-      });
-      const payment = await resp.json();
-
-      if (payment.status === 'approved') {
-        const pedidoId = payment.metadata?.pedido_id;
-        if (pedidoId) {
-          await supabase.from('pedidos')
-            .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
-            .eq('id', pedidoId);
-          console.log('Pedido pago:', pedidoId);
-        }
-      }
-    } catch(e) { console.error('Webhook erro:', e.message); }
+  const { event, payment } = req.body;
+  console.log('Webhook Asaas:', event, payment?.id);
+  if (event === 'PAYMENT_RECEIVED' || event === 'PAYMENT_CONFIRMED') {
+    const pedidoId = payment?.externalReference;
+    if (pedidoId) {
+      await supabase.from('pedidos').update({ status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedidoId);
+    }
   }
   res.json({ ok: true });
 });
 
 app.get('/pagamentos/status/:pedido_id', autenticar, async (req, res) => {
-  const { data: pedido } = await supabase
-    .from('pedidos').select('status, pagarme_order_id, pago_em')
-    .eq('id', req.params.pedido_id).single();
+  const { data: pedido } = await supabase.from('pedidos').select('status, pagarme_order_id, pago_em').eq('id', req.params.pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
-
-  // Verifica status direto no MP se tiver order_id
   if (pedido.pagarme_order_id && pedido.status === 'aguardando_pagamento') {
     try {
-      const resp = await fetch(`https://api.mercadopago.com/v1/payments/${pedido.pagarme_order_id}`, {
-        headers: { 'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}` }
-      });
-      const payment = await resp.json();
-      if (payment.status === 'approved') {
-        await supabase.from('pedidos')
-          .update({ status: 'em_andamento', pago_em: new Date().toISOString() })
-          .eq('id', req.params.pedido_id);
+      const cob = await asaasReq('GET', `/payments/${pedido.pagarme_order_id}`);
+      if (cob.status === 'RECEIVED' || cob.status === 'CONFIRMED') {
+        await supabase.from('pedidos').update({ status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', req.params.pedido_id);
         return res.json({ status: 'em_andamento', pago_em: new Date().toISOString() });
       }
     } catch {}
   }
-
   res.json({ status: pedido.status, pago_em: pedido.pago_em });
 });
 
-// ════════════════════════════════════════════════════════
 //  ORCAMENTOS
 // ════════════════════════════════════════════════════════
 
