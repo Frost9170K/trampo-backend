@@ -565,11 +565,13 @@ async function buscarOuCriarCliente(usuario) {
     const busca = await asaasReq('GET', `/customers?email=${encodeURIComponent(usuario.email)}`);
     if (busca.data?.length > 0) return busca.data[0].id;
   } catch {}
-  const c = await asaasReq('POST', '/customers', {
+  const body = {
     name: usuario.nome, email: usuario.email,
     phone: (usuario.telefone || '').replace(/[^0-9]/g, ''),
     groupName: 'Trampo',
-  });
+  };
+  if (usuario.cpf) body.cpfCnpj = usuario.cpf.replace(/[^0-9]/g, '');
+  const c = await asaasReq('POST', '/customers', body);
   return c.id;
 }
 
