@@ -593,13 +593,15 @@ async function transferirAutonomo(pedido) {
 app.post('/pagamentos/pix', autenticar, async (req, res) => {
   const { pedido_id } = req.body;
   if (!pedido_id) return res.status(400).json({ erro: 'pedido_id obrigatorio.' });
+  const { cpf_temp } = req.body;
   const { data: pedido } = await supabase
     .from('pedidos').select('*, usuarios(*), servicos(*)')
     .eq('id', pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
 
   try {
-    const clienteId = await buscarOuCriarCliente(pedido.usuarios);
+    const usuario = { ...pedido.usuarios, cpf: pedido.usuarios.cpf || cpf_temp };
+    const clienteId = await buscarOuCriarCliente(usuario);
     const venc = new Date(Date.now() + 3600000).toISOString().split('T')[0];
     const cob = await asaasReq('POST', '/payments', {
       customer: clienteId, billingType: 'PIX',
@@ -932,6 +934,14 @@ app.post('/admin/liberar/:pedido_id', async (req, res) => {
   }).eq('id', req.params.pedido_id);
 
   res.json({ mensagem: `Pedido ${req.params.pedido_id} liberado pelo admin.` });
+});
+
+
+app.patch('/usuarios/atualizar-cpf', autenticar, async (req, res) => {
+  const { cpf } = req.body;
+  if (!cpf) return res.status(400).json({ erro: 'CPF obrigatorio.' });
+  await supabase.from('usuarios').update({ cpf }).eq('id', req.usuario.id);
+  res.json({ mensagem: 'CPF atualizado!' });
 });
 
 // ── Health check ──────────────────────────────────────────
