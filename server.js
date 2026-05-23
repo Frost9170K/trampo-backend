@@ -561,16 +561,29 @@ async function asaasReq(method, path, body) {
 }
 
 async function buscarOuCriarCliente(usuario) {
+  const cpfLimpo = usuario.cpf ? usuario.cpf.replace(/[^0-9]/g, '') : '';
+  
   try {
     const busca = await asaasReq('GET', `/customers?email=${encodeURIComponent(usuario.email)}`);
-    if (busca.data?.length > 0) return busca.data[0].id;
+    if (busca.data?.length > 0) {
+      const clienteExistente = busca.data[0];
+      // Atualizar CPF se ainda não tiver
+      if (cpfLimpo && !clienteExistente.cpfCnpj) {
+        await asaasReq('PUT', `/customers/${clienteExistente.id}`, {
+          name: usuario.nome,
+          cpfCnpj: cpfLimpo,
+        }).catch(()=>{});
+      }
+      return clienteExistente.id;
+    }
   } catch {}
+
   const body = {
     name: usuario.nome, email: usuario.email,
     phone: (usuario.telefone || '').replace(/[^0-9]/g, ''),
     groupName: 'Trampo',
   };
-  if (usuario.cpf) body.cpfCnpj = usuario.cpf.replace(/[^0-9]/g, '');
+  if (cpfLimpo) body.cpfCnpj = cpfLimpo;
   const c = await asaasReq('POST', '/customers', body);
   return c.id;
 }
