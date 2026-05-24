@@ -291,7 +291,7 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
 
   const { data, error } = await supabase
     .from('pedidos')
-    .update({ status: 'concluido', concluido_em: new Date().toISOString() })
+    .update({ status: 'concluido', concluido_em: new Date().toISOString(), transferido: false })
     .eq('id', req.params.id).select();
 
   // Incrementa contador de serviços do autônomo
@@ -548,6 +548,7 @@ app.post('/denuncias', autenticar, async (req, res) => {
 
 const ASAAS_URL = 'https://api.asaas.com/v3';
 const ASAAS_KEY = process.env.ASAAS_API_KEY;
+const TAXA_ASAAS_PIX = 1.98; // Taxa fixa por cobrança Pix (Pix + mensageria)
 
 async function asaasReq(method, path, body) {
   const r = await fetch(`${ASAAS_URL}${path}`, {
@@ -595,6 +596,7 @@ async function transferirAutonomo(pedido) {
   }
   try {
     const valor = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
+    if (valor < 1) { console.log('Valor insuficiente para transferência'); return; }
     const chave = pedido.autonomos.chave_pix.trim();
     
     // Detectar tipo da chave Pix
@@ -617,7 +619,12 @@ async function transferirAutonomo(pedido) {
       pixAddressKeyType,
       description: `Trampo - Pagamento pedido ${pedido.id}`,
     });
-    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome} (${pixAddressKeyType}: ${chave})`);
+    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome} (${pixAddressKeyType}: ${chave})`)
+    // Marcar como transferido no banco
+    await supabase.from('pedidos')
+      .update({ transferido: true, transferido_em: new Date().toISOString() })
+      .eq('id', pedido.id)
+      .catch(()=>{});;
   } catch(e) {
     console.log('Erro transferência Asaas:', e.message);
   }
@@ -986,6 +993,46 @@ app.put('/usuarios/perfil', autenticar, async (req, res) => {
   if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Perfil atualizado!' });
 });
+
+
+// ════════════════════════════════════════════════════════
+//  RETRY DE TRANSFERÊNCIAS PENDENTES
+// ════════════════════════════════════════════════════════
+
+async function tentarTransferenciaPendente(pedidoId) {
+  const { data: pedido } = await supabase
+    .from('pedidos')
+    .select('*, autonomos(chave_pix, nome)')
+    .eq('id', pedidoId)
+    .single();
+  
+  if (!pedido || pedido.transferido) return;
+  
+  try {
+    await transferirAutonomo(pedido);
+    // Marcar como transferido
+    await supabase.from('pedidos')
+      .update({ transferido: true, transferido_em: new Date().toISOString() })
+      .eq('id', pedidoId);
+    console.log(`Transferência concluída para pedido ${pedidoId}`);
+  } catch(e) {
+    console.log(`Retry falhou para pedido ${pedidoId}:`, e.message);
+  }
+}
+
+// Rodar retry a cada 2 horas
+setInterval(async () => {
+  const { data: pendentes } = await supabase
+    .from('pedidos')
+    .select('id')
+    .eq('status', 'concluido')
+    .eq('transferido', false);
+  
+  for (const p of pendentes || []) {
+    await tentarTransferenciaPendente(p.id);
+    await new Promise(r => setTimeout(r, 2000)); // espera 2s entre cada
+  }
+}, 2 * 60 * 60 * 1000);
 
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
