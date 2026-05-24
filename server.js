@@ -567,12 +567,12 @@ async function buscarOuCriarCliente(usuario) {
     const busca = await asaasReq('GET', `/customers?email=${encodeURIComponent(usuario.email)}`);
     if (busca.data?.length > 0) {
       const clienteExistente = busca.data[0];
-      // Atualizar CPF se ainda não tiver
-      if (cpfLimpo && !clienteExistente.cpfCnpj) {
+      // SEMPRE atualizar CPF — garante que nunca vai faltar
+      if (cpfLimpo) {
         await asaasReq('PUT', `/customers/${clienteExistente.id}`, {
           name: usuario.nome,
           cpfCnpj: cpfLimpo,
-        }).catch(()=>{});
+        }).catch(e => console.log('Erro ao atualizar CPF:', e.message));
       }
       return clienteExistente.id;
     }
@@ -589,15 +589,35 @@ async function buscarOuCriarCliente(usuario) {
 }
 
 async function transferirAutonomo(pedido) {
-  if (!pedido.autonomos?.chave_pix) return;
+  if (!pedido.autonomos?.chave_pix) {
+    console.log('Autônomo sem chave Pix — transferência não realizada');
+    return;
+  }
   try {
     const valor = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
+    const chave = pedido.autonomos.chave_pix.trim();
+    
+    // Detectar tipo da chave Pix
+    let pixAddressKeyType = 'EMAIL';
+    const cpfRegex = /^[0-9]{11}$/;
+    const cnpjRegex = /^[0-9]{14}$/;
+    const telefoneRegex = /^[+]?[0-9]{10,13}$/;
+    const chaveLimpa = chave.replace(/[^0-9]/g,'');
+    
+    if (cpfRegex.test(chaveLimpa)) pixAddressKeyType = 'CPF';
+    else if (cnpjRegex.test(chaveLimpa)) pixAddressKeyType = 'CNPJ';
+    else if (telefoneRegex.test(chave.replace(/[^0-9+]/g,''))) pixAddressKeyType = 'PHONE';
+    else if (chave.includes('@')) pixAddressKeyType = 'EMAIL';
+    else pixAddressKeyType = 'EVP'; // chave aleatória
+
     await asaasReq('POST', '/transfers', {
       value: valor,
-      pixAddressKey: pedido.autonomos.chave_pix,
-      description: `Trampo - Pedido ${pedido.id}`,
+      operationType: 'PIX',
+      pixAddressKey: chave,
+      pixAddressKeyType,
+      description: `Trampo - Pagamento pedido ${pedido.id}`,
     });
-    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome}`);
+    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome} (${pixAddressKeyType}: ${chave})`);
   } catch(e) {
     console.log('Erro transferência Asaas:', e.message);
   }
