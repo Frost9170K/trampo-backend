@@ -207,7 +207,7 @@ app.get('/autonomos/painel/metricas', autenticar, async (req, res) => {
 
 // ── Atualizar perfil do autônomo ──────────────────────────
 app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
-  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix'];
+  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas'];
   const update = {};
   campos.forEach(c => { if (req.body[c] !== undefined) update[c] = req.body[c]; });
 
@@ -254,7 +254,7 @@ app.post('/usuarios/login', async (req, res) => {
 //  PEDIDOS
 // ════════════════════════════════════════════════════════
 app.post('/pedidos', autenticar, async (req, res) => {
-  const { autonomo_id, servico_id, descricao, data_agendada, observacao, metodo_pagamento, data_agendamento, hora_agendamento } = req.body;
+  const { autonomo_id, servico_id, descricao, data_agendada, observacao, metodo_pagamento, data_agendamento, hora_agendamento, endereco_servico } = req.body;
   if (!autonomo_id || !servico_id) return res.status(400).json({ erro: 'Dados do serviço obrigatórios.' });
 
   // Busca preço do serviço
@@ -272,6 +272,7 @@ app.post('/pedidos', autenticar, async (req, res) => {
     data_agendada: data_agendamento || data_agendada || null,
     hora_agendamento: hora_agendamento || null,
     observacao: observacao || null,
+    endereco_servico: endereco_servico || null,
     metodo_pagamento: metodo_pagamento || 'pix',
     valor_servico, taxa_plataforma, valor_total
   }]).select();
