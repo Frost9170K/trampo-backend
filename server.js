@@ -137,7 +137,7 @@ app.get('/autonomos', async (req, res) => {
   // Busca simples por categoria / nome
   let query = supabase
     .from('autonomos')
-    .select('id, nome, categoria, especialidade, bairro, nota_media, total_avaliacoes, verificado, preco_medio')
+    .select('id, nome, categoria, especialidade, bairro, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo')
     .eq('ativo', true)
     .order('nota_media', { ascending: false });
 
@@ -202,6 +202,73 @@ app.get('/autonomos/painel/metricas', autenticar, async (req, res) => {
     concluidos_semana: concluidos.length,
     faturamento_semana: faturamento,
     avaliacoes_recentes: avaliacoes.data || []
+  });
+});
+
+
+// ── Estatísticas detalhadas do autônomo ───────────────────
+app.get('/autonomos/painel/estatisticas', autenticar, async (req, res) => {
+  const id = req.usuario.id;
+
+  const [pedidos, avaliacoes] = await Promise.all([
+    supabase.from('pedidos').select('valor_servico, status, criado_em, concluido_em')
+      .eq('autonomo_id', id),
+    supabase.from('avaliacoes').select('nota, criado_em')
+      .eq('autonomo_id', id)
+  ]);
+
+  const todosPedidos = pedidos.data || [];
+  const todasAval = avaliacoes.data || [];
+  const concluidos = todosPedidos.filter(p => p.status === 'concluido');
+
+  // Faturamento total e ganhos (90%)
+  const faturamentoTotal = concluidos.reduce((s,p)=>s+parseFloat(p.valor_servico||0),0);
+  const ganhosTotal = faturamentoTotal * 0.9;
+
+  // Últimos 6 meses
+  const meses = [];
+  const agora = new Date();
+  for (let i = 5; i >= 0; i--) {
+    const mes = new Date(agora.getFullYear(), agora.getMonth() - i, 1);
+    const mesFim = new Date(agora.getFullYear(), agora.getMonth() - i + 1, 1);
+    const pedidosMes = concluidos.filter(p => {
+      const d = new Date(p.concluido_em || p.criado_em);
+      return d >= mes && d < mesFim;
+    });
+    const fatMes = pedidosMes.reduce((s,p)=>s+parseFloat(p.valor_servico||0),0);
+    meses.push({
+      mes: mes.toLocaleDateString('pt-BR', { month: 'short' }),
+      pedidos: pedidosMes.length,
+      faturamento: parseFloat(fatMes.toFixed(2)),
+      ganhos: parseFloat((fatMes * 0.9).toFixed(2)),
+    });
+  }
+
+  // Nota média
+  const notaMedia = todasAval.length > 0
+    ? (todasAval.reduce((s,a)=>s+a.nota,0) / todasAval.length).toFixed(1)
+    : 0;
+
+  // Taxa de conclusão
+  const taxaConclusao = todosPedidos.length > 0
+    ? Math.round((concluidos.length / todosPedidos.length) * 100)
+    : 0;
+
+  // Ticket médio
+  const ticketMedio = concluidos.length > 0
+    ? (faturamentoTotal / concluidos.length).toFixed(2)
+    : 0;
+
+  res.json({
+    faturamento_total: parseFloat(faturamentoTotal.toFixed(2)),
+    ganhos_total: parseFloat(ganhosTotal.toFixed(2)),
+    total_pedidos: todosPedidos.length,
+    total_concluidos: concluidos.length,
+    nota_media: parseFloat(notaMedia),
+    total_avaliacoes: todasAval.length,
+    taxa_conclusao: taxaConclusao,
+    ticket_medio: parseFloat(ticketMedio),
+    grafico_meses: meses,
   });
 });
 
@@ -419,6 +486,17 @@ app.post('/mensagens', autenticar, async (req, res) => {
   }]).select();
 
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Enviar push para o destinatário
+  try {
+    const tabela = para_tipo === 'cliente' ? 'usuarios' : 'autonomos';
+    const { data: dest } = await supabase.from(tabela).select('push_token, nome').eq('id', para_id).single();
+    if (dest?.push_token) {
+      const remetente = req.usuario.nome || 'Alguém';
+      enviarPush(dest.push_token, `💬 ${remetente}`, texto.trim().slice(0,100), { tipo: 'mensagem', de_id: req.usuario.id });
+    }
+  } catch {}
+
   res.status(201).json({ mensagem: data[0] });
 });
 
@@ -440,6 +518,16 @@ app.get('/mensagens/:outro_id', autenticar, async (req, res) => {
     .eq('de_id', outroId);
 
   res.json(data);
+});
+
+
+app.get('/mensagens/nao-lidas/total', autenticar, async (req, res) => {
+  const { count } = await supabase
+    .from('mensagens')
+    .select('*', { count: 'exact', head: true })
+    .eq('para_id', req.usuario.id)
+    .eq('lida', false);
+  res.json({ total: count || 0 });
 });
 
 app.get('/conversas', autenticar, async (req, res) => {
@@ -706,6 +794,21 @@ app.post('/pagamentos/webhook', async (req, res) => {
     const pedidoId = payment?.externalReference;
     if (pedidoId) {
       await supabase.from('pedidos').update({ status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedidoId);
+
+      // Notificar o autônomo que recebeu um pedido pago
+      try {
+        const { data: pedido } = await supabase
+          .from('pedidos').select('*, autonomos(push_token, nome), servicos(nome)')
+          .eq('id', pedidoId).single();
+        if (pedido?.autonomos?.push_token) {
+          enviarPush(
+            pedido.autonomos.push_token,
+            '🎉 Novo pedido pago!',
+            `Você recebeu um pedido${pedido.servicos?.nome ? ' de ' + pedido.servicos.nome : ''}. Confira na agenda!`,
+            { tipo: 'pedido', pedido_id: pedidoId }
+          );
+        }
+      } catch {}
     }
   }
   res.json({ ok: true });
@@ -737,6 +840,17 @@ app.post('/orcamentos', autenticar, async (req, res) => {
     status: 'aguardando_resposta',
   }]).select();
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar autônomo que recebeu pedido de orçamento
+  try {
+    const { data: auto } = await supabase.from('autonomos').select('push_token').eq('id', autonomo_id).single();
+    if (auto?.push_token) {
+      enviarPush(auto.push_token, '📋 Novo pedido de orçamento!',
+        'Um cliente quer um orçamento seu. Responda agora!',
+        { tipo: 'orcamento_pedido' });
+    }
+  } catch {}
+
   res.status(201).json({ orcamento: data[0] });
 });
 
@@ -747,6 +861,18 @@ app.patch('/orcamentos/:id/responder', autenticar, async (req, res) => {
     .update({ valor, prazo, observacao, status: 'respondido', respondido_em: new Date().toISOString() })
     .eq('id', req.params.id).eq('autonomo_id', req.usuario.id).select();
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar cliente que recebeu orçamento
+  try {
+    const orc = data[0];
+    const { data: cliente } = await supabase.from('usuarios').select('push_token').eq('id', orc.usuario_id).single();
+    if (cliente?.push_token) {
+      enviarPush(cliente.push_token, '💰 Orçamento recebido!',
+        `Você recebeu um orçamento de R$ ${parseFloat(valor).toFixed(2)}. Confira no app!`,
+        { tipo: 'orcamento', orcamento_id: orc.id });
+    }
+  } catch {}
+
   res.json({ orcamento: data[0] });
 });
 
@@ -900,6 +1026,7 @@ app.patch('/orcamentos/:id/recusar', autenticar, async (req, res) => {
 async function verificarLiberacaoAutomatica() {
   try {
     const limite = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    // Liberar apenas pedidos em andamento, pagos há +48h, E QUE NÃO ESTÃO EM DISPUTA
     const { data: pedidos } = await supabase
       .from('pedidos')
       .select('*, autonomos(chave_pix, nome)')
@@ -907,29 +1034,25 @@ async function verificarLiberacaoAutomatica() {
       .lt('pago_em', limite);
 
     for (const pedido of pedidos || []) {
-      console.log(`Liberando automaticamente pedido ${pedido.id} — 48h sem confirmação`);
+      // Segurança extra: pular se houver disputa registrada
+      if (pedido.disputa_em || pedido.status === 'em_disputa') {
+        console.log(`Pedido ${pedido.id} tem disputa — liberação automática pausada`);
+        continue;
+      }
+
+      console.log(`Liberando automaticamente pedido ${pedido.id} — 48h sem confirmação nem disputa`);
       await supabase.from('pedidos')
-        .update({ status: 'concluido', concluido_em: new Date().toISOString(), liberado_automaticamente: true })
+        .update({
+          status: 'concluido',
+          concluido_em: new Date().toISOString(),
+          liberado_automaticamente: true,
+          transferido: false
+        })
         .eq('id', pedido.id);
 
-      // Transferir pro autônomo
-      if (pedido.autonomos?.chave_pix && process.env.MP_ACCESS_TOKEN) {
-        const valorAutonomo = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
-        await fetch('https://api.mercadopago.com/v1/payments', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-            'X-Idempotency-Key': `auto-${pedido.id}`,
-          },
-          body: JSON.stringify({
-            transaction_amount: valorAutonomo,
-            description: `Trampo - Pagamento automático #${pedido.id}`,
-            payment_method_id: 'pix',
-            payer: { email: 'pagamento@trampo.app' },
-            point_of_interaction: { linked_to: pedido.autonomos.chave_pix }
-          })
-        }).catch(e => console.log('Erro transferência auto:', e.message));
+      // Transferir pro autônomo via Asaas
+      if (pedido.autonomos?.chave_pix) {
+        await transferirAutonomo({ ...pedido, autonomos: pedido.autonomos });
       }
     }
   } catch(e) {
@@ -940,23 +1063,122 @@ async function verificarLiberacaoAutomatica() {
 // Rodar a cada hora
 setInterval(verificarLiberacaoAutomatica, 60 * 60 * 1000);
 
-// 2. Rota de disputa — autônomo abre disputa se cliente não confirmar
+// 2. Rota de disputa — cliente OU autônomo abre, com foto + descrição obrigatórias
 app.post('/pedidos/:id/disputa', autenticar, async (req, res) => {
-  const { motivo } = req.body;
+  const { motivo, foto_url } = req.body;
   const { data: pedido } = await supabase
     .from('pedidos').select('*').eq('id', req.params.id).single();
 
   if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
-  if (pedido.autonomo_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
-  if (pedido.status !== 'em_andamento') return res.status(400).json({ erro: 'Só é possível abrir disputa em pedidos em andamento.' });
+
+  // Cliente OU autônomo do pedido podem abrir disputa
+  const ehCliente = pedido.usuario_id === req.usuario.id;
+  const ehAutonomo = pedido.autonomo_id === req.usuario.id;
+  if (!ehCliente && !ehAutonomo) return res.status(403).json({ erro: 'Sem permissão.' });
+
+  // Só em pedidos pagos / em andamento
+  if (!['em_andamento','aguardando_pagamento'].includes(pedido.status)) {
+    return res.status(400).json({ erro: 'Só é possível abrir disputa em pedidos pagos e em andamento.' });
+  }
+
+  // Descrição obrigatória (mínimo 10 caracteres)
+  if (!motivo || motivo.trim().length < 10) {
+    return res.status(400).json({ erro: 'Descreva o problema com pelo menos 10 caracteres.' });
+  }
 
   await supabase.from('pedidos').update({
     status: 'em_disputa',
-    disputa_motivo: motivo || 'Serviço concluído sem confirmação do cliente.',
+    disputa_motivo: motivo.trim(),
+    disputa_foto: foto_url || null,
+    disputa_aberta_por: ehCliente ? 'cliente' : 'autonomo',
     disputa_em: new Date().toISOString()
   }).eq('id', req.params.id);
 
-  res.json({ mensagem: 'Disputa aberta. Analisaremos em até 24h.' });
+  res.json({ mensagem: 'Disputa aberta! Nossa equipe vai analisar e entrar em contato em até 24h pelo Instagram @trampoapp_.' });
+});
+
+// Listar disputas (para painel admin)
+app.get('/admin/disputas', async (req, res) => {
+  const { senha } = req.query;
+  if (senha !== process.env.ADMIN_SECRET) return res.status(403).json({ erro: 'Sem permissão.' });
+
+  const { data } = await supabase
+    .from('pedidos')
+    .select('*, usuarios(nome, email, telefone), autonomos(nome, email, telefone, chave_pix), servicos(nome)')
+    .eq('status', 'em_disputa')
+    .order('disputa_em', { ascending: true });
+
+  res.json({ disputas: data || [] });
+});
+
+// Resolver disputa — estornar / liberar / dividir
+app.post('/admin/disputas/:id/resolver', async (req, res) => {
+  const { senha, decisao, percentual_autonomo } = req.body;
+  if (senha !== process.env.ADMIN_SECRET) return res.status(403).json({ erro: 'Sem permissão.' });
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, autonomos(chave_pix, nome)').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.status !== 'em_disputa') return res.status(400).json({ erro: 'Pedido não está em disputa.' });
+
+  // decisao: 'estornar' (devolve cliente) | 'liberar' (paga autônomo 90%) | 'dividir' (paga % ao autônomo)
+  if (decisao === 'estornar') {
+    // Estornar cobrança no Asaas (volta pra origem)
+    try {
+      if (pedido.pagarme_order_id) {
+        await asaasReq('POST', `/payments/${pedido.pagarme_order_id}/refund`, {});
+      }
+    } catch(e) { console.log('Erro estorno:', e.message); }
+
+    await supabase.from('pedidos').update({
+      status: 'cancelado',
+      disputa_resolucao: 'estornado',
+      disputa_resolvido_em: new Date().toISOString()
+    }).eq('id', req.params.id);
+
+    return res.json({ mensagem: 'Disputa resolvida: valor estornado ao cliente.' });
+  }
+
+  if (decisao === 'liberar') {
+    await supabase.from('pedidos').update({
+      status: 'concluido',
+      concluido_em: new Date().toISOString(),
+      disputa_resolucao: 'liberado_autonomo',
+      disputa_resolvido_em: new Date().toISOString(),
+      transferido: false
+    }).eq('id', req.params.id);
+
+    if (pedido.autonomos?.chave_pix) {
+      await transferirAutonomo({ ...pedido, autonomos: pedido.autonomos });
+    }
+    return res.json({ mensagem: 'Disputa resolvida: pagamento liberado ao autônomo.' });
+  }
+
+  if (decisao === 'dividir') {
+    const pct = parseFloat(percentual_autonomo) || 50;
+    const valorAutonomo = parseFloat((pedido.valor_servico * (pct/100)).toFixed(2));
+
+    // Transferir parte ao autônomo
+    if (pedido.autonomos?.chave_pix && valorAutonomo >= 1) {
+      await transferirAutonomo({
+        ...pedido,
+        autonomos: pedido.autonomos,
+        valor_servico: pedido.valor_servico * (pct/100) / 0.9  // ajusta pra transferir o pct exato
+      });
+    }
+
+    await supabase.from('pedidos').update({
+      status: 'concluido',
+      concluido_em: new Date().toISOString(),
+      disputa_resolucao: `dividido_${pct}`,
+      disputa_resolvido_em: new Date().toISOString(),
+      transferido: true
+    }).eq('id', req.params.id);
+
+    return res.json({ mensagem: `Disputa resolvida: ${pct}% liberado ao autônomo (R$ ${valorAutonomo.toFixed(2)}).` });
+  }
+
+  res.status(400).json({ erro: 'Decisão inválida. Use: estornar, liberar ou dividir.' });
 });
 
 // 3. Admin libera pagamento (você mesmo via API)
@@ -1034,6 +1256,47 @@ setInterval(async () => {
     await new Promise(r => setTimeout(r, 2000)); // espera 2s entre cada
   }
 }, 2 * 60 * 60 * 1000);
+
+
+// ════════════════════════════════════════════════════════
+//  NOTIFICAÇÕES PUSH (via Expo)
+// ════════════════════════════════════════════════════════
+
+async function enviarPush(pushToken, titulo, corpo, dados = {}) {
+  if (!pushToken || !pushToken.startsWith('ExponentPushToken')) return;
+  try {
+    await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        to: pushToken,
+        sound: 'default',
+        title: titulo,
+        body: corpo,
+        data: dados,
+        priority: 'high',
+      }),
+    });
+    console.log(`Push enviado: ${titulo}`);
+  } catch(e) {
+    console.log('Erro ao enviar push:', e.message);
+  }
+}
+
+// Salvar push token do usuário/autônomo
+app.post('/push-token', autenticar, async (req, res) => {
+  const { push_token } = req.body;
+  if (!push_token) return res.status(400).json({ erro: 'push_token obrigatorio.' });
+
+  // Tenta atualizar tanto em usuarios quanto em autonomos
+  await supabase.from('usuarios').update({ push_token }).eq('id', req.usuario.id).catch(()=>{});
+  await supabase.from('autonomos').update({ push_token }).eq('id', req.usuario.id).catch(()=>{});
+
+  res.json({ mensagem: 'Token salvo!' });
+});
 
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
