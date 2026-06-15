@@ -14,6 +14,66 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// ── Email (Resend) ───────────────────────────────────────
+// Configure no Railway:
+//   RESEND_API_KEY  = a chave da API do Resend (re_...)
+//   EMAIL_FROM      = ex: "Trampo <nao-responda@seudominio.com.br>"
+//   APP_URL         = ex: https://trampo917.netlify.app  (base dos links)
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM     = process.env.EMAIL_FROM || 'Trampo <onboarding@resend.dev>';
+const APP_URL        = process.env.APP_URL || 'https://trampo917.netlify.app';
+
+async function enviarEmail(para, assunto, html) {
+  // Sem chave configurada → não envia (modo dev). Retorna false sem quebrar.
+  if (!RESEND_API_KEY) {
+    console.warn('[email] RESEND_API_KEY não configurada — email não enviado para', para);
+    return false;
+  }
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: EMAIL_FROM, to: [para], subject: assunto, html }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.error('[email] Falha ao enviar:', resp.status, txt);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('[email] Erro:', e.message);
+    return false;
+  }
+}
+
+// Template do email de recuperação de senha
+function emailRecuperacaoSenha(nome, link) {
+  return `
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;background:#F8FAFC;border-radius:12px;overflow:hidden;border:1px solid #E2E8F0">
+  <div style="background:#0F172A;padding:24px;text-align:center">
+    <span style="font-family:Georgia,serif;font-size:26px;font-weight:700;color:#10B981">trampo</span>
+  </div>
+  <div style="padding:32px 28px">
+    <h1 style="font-size:20px;color:#0F172A;margin:0 0 16px">Redefinição de senha</h1>
+    <p style="font-size:15px;color:#334155;line-height:1.6;margin:0 0 12px">Olá${nome ? ', ' + nome : ''}!</p>
+    <p style="font-size:15px;color:#334155;line-height:1.6;margin:0 0 24px">Recebemos um pedido para redefinir a senha da sua conta no Trampo. Clique no botão abaixo para criar uma nova senha:</p>
+    <div style="text-align:center;margin:0 0 24px">
+      <a href="${link}" style="display:inline-block;background:#10B981;color:#FFFFFF;text-decoration:none;padding:14px 32px;border-radius:12px;font-weight:700;font-size:16px">Redefinir senha</a>
+    </div>
+    <p style="font-size:13px;color:#64748B;line-height:1.6;margin:0 0 8px">Este link expira em 1 hora. Se você não pediu para redefinir sua senha, ignore este email — sua conta continua segura.</p>
+    <p style="font-size:13px;color:#64748B;line-height:1.6;margin:0">Se o botão não funcionar, copie e cole este endereço no navegador:<br><span style="color:#10B981;word-break:break-all">${link}</span></p>
+  </div>
+  <div style="background:#0F172A;padding:16px;text-align:center">
+    <p style="font-size:12px;color:#94A3B8;margin:0">Trampo — Serviços e autônomos perto de você</p>
+  </div>
+</div>`;
+}
+
+
 // ── Middlewares ───────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
@@ -29,6 +89,15 @@ function autenticar(req, res, next) {
   } catch {
     res.status(401).json({ erro: 'Token inválido.' });
   }
+}
+
+// ── Validação de UUID ─────────────────────────────────────
+// Garante que IDs vindos da URL (req.params) são UUIDs válidos antes de
+// usá-los em queries — especialmente importante em filtros .or() que
+// concatenam strings. Bloqueia parâmetros forjados.
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function ehUUID(valor) {
+  return typeof valor === 'string' && UUID_REGEX.test(valor);
 }
 
 // ════════════════════════════════════════════════════════
@@ -60,7 +129,7 @@ app.post('/pre-cadastro', async (req, res) => {
 app.post('/autonomos/cadastro', async (req, res) => {
   const { nome, email, senha, telefone, bairro,
           categoria, especialidade, bio, preco_medio,
-          disponibilidade, lat, lng } = req.body;
+          disponibilidade, lat, lng, cpf, cidade } = req.body;
 
   if (!nome || !email || !senha || !telefone || !categoria) {
     return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
@@ -82,7 +151,9 @@ app.post('/autonomos/cadastro', async (req, res) => {
     .from('autonomos')
     .insert([{ nome, email, senha_hash, telefone, bairro,
                categoria, especialidade, bio, preco_medio,
-               disponibilidade, lat, lng, localizacao }])
+               disponibilidade, lat, lng, localizacao,
+               ...(cpf ? { cpf } : {}),
+               ...(cidade ? { cidade } : {}) }])
     .select('id, nome, email, categoria');
 
   if (error) return res.status(500).json({ erro: error.message });
@@ -120,7 +191,7 @@ app.post('/autonomos/login', async (req, res) => {
 
 // ── Buscar autônomos (com filtros e GPS) ─────────────────
 app.get('/autonomos', async (req, res) => {
-  const { categoria, lat, lng, raio = 10, busca } = req.query;
+  const { categoria, lat, lng, raio = 10, busca, cidade } = req.query;
 
   // Busca por GPS (função do banco)
   if (lat && lng) {
@@ -142,6 +213,7 @@ app.get('/autonomos', async (req, res) => {
     .order('nota_media', { ascending: false });
 
   if (categoria) query = query.eq('categoria', categoria);
+  if (cidade)    query = query.eq('cidade', cidade);
   if (busca)     query = query.ilike('nome', `%${busca}%`);
 
   const { data, error } = await query;
@@ -156,7 +228,7 @@ app.get('/autonomos/:id', async (req, res) => {
     .select(`
       id, nome, categoria, especialidade, bairro, bio,
       nota_media, total_avaliacoes, total_servicos,
-      verificado, disponibilidade, preco_medio,
+      verificado, disponibilidade, disponibilidade_dias, disponibilidade_horas, preco_medio,
       servicos ( id, nome, descricao, preco, unidade ),
       avaliacoes ( nota, comentario, criado_em,
         usuarios ( nome ) )
@@ -274,7 +346,7 @@ app.get('/autonomos/painel/estatisticas', autenticar, async (req, res) => {
 
 // ── Atualizar perfil do autônomo ──────────────────────────
 app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
-  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas'];
+  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas','cpf'];
   const update = {};
   campos.forEach(c => { if (req.body[c] !== undefined) update[c] = req.body[c]; });
 
@@ -289,7 +361,7 @@ app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
 //  USUÁRIOS (clientes)
 // ════════════════════════════════════════════════════════
 app.post('/usuarios/cadastro', async (req, res) => {
-  const { nome, email, senha, telefone } = req.body;
+  const { nome, email, senha, telefone, cpf } = req.body;
   if (!nome || !email || !senha) return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
 
   const { data: existe } = await supabase
@@ -297,8 +369,10 @@ app.post('/usuarios/cadastro', async (req, res) => {
   if (existe) return res.status(409).json({ erro: 'Email já cadastrado.' });
 
   const senha_hash = await bcrypt.hash(senha, 10);
+  const novoUsuario = { nome, email, senha_hash, telefone };
+  if (cpf) novoUsuario.cpf = cpf; // salva o CPF já no cadastro (evita pedir de novo no pagamento)
   const { data, error } = await supabase
-    .from('usuarios').insert([{ nome, email, senha_hash, telefone }]).select('id, nome, email');
+    .from('usuarios').insert([novoUsuario]).select('id, nome, email');
 
   if (error) return res.status(500).json({ erro: error.message });
 
@@ -357,15 +431,22 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
   if (pedido.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
   if (pedido.status !== 'em_andamento') return res.status(400).json({ erro: 'Pedido não está em andamento.' });
 
+  // Update condicional (só conclui se ainda estiver em_andamento) — evita
+  // que dois cliques simultâneos, ou o job de 48h, concluam o mesmo pedido 2x.
   const { data, error } = await supabase
     .from('pedidos')
     .update({ status: 'concluido', concluido_em: new Date().toISOString(), transferido: false })
-    .eq('id', req.params.id).select();
+    .eq('id', req.params.id)
+    .eq('status', 'em_andamento')
+    .select();
+
+  if (error) return res.status(500).json({ erro: error.message });
+  if (!data || data.length === 0) {
+    return res.status(400).json({ erro: 'Pedido já foi concluído ou não está em andamento.' });
+  }
 
   // Incrementa contador de serviços do autônomo
   await supabase.rpc('incrementar_servicos', { autonomo_id: pedido.autonomo_id });
-
-  if (error) return res.status(500).json({ erro: error.message });
 
   // Transferir automaticamente pro autônomo via Asaas
   try {
@@ -386,7 +467,7 @@ app.get('/pedidos', autenticar, async (req, res) => {
   const campo = req.usuario.tipo === 'autonomo' ? 'autonomo_id' : 'usuario_id';
   const { data, error } = await supabase
     .from('pedidos')
-    .select('*, servicos(nome), autonomos(nome, especialidade, categoria), usuarios(nome), avaliacoes(nota, comentario)')
+    .select('*, servicos(nome), autonomos(nome, especialidade, categoria, telefone), usuarios(nome, telefone), avaliacoes(nota, comentario)')
     .eq(campo, req.usuario.id)
     .order('criado_em', { ascending: false });
 
@@ -490,9 +571,12 @@ app.post('/mensagens', autenticar, async (req, res) => {
   // Enviar push para o destinatário
   try {
     const tabela = para_tipo === 'cliente' ? 'usuarios' : 'autonomos';
-    const { data: dest } = await supabase.from(tabela).select('push_token, nome').eq('id', para_id).single();
+    const { data: dest } = await supabase.from(tabela).select('push_token').eq('id', para_id).single();
     if (dest?.push_token) {
-      const remetente = req.usuario.nome || 'Alguém';
+      // Buscar nome real do remetente (o JWT só guarda id e tipo)
+      const tabelaRemetente = req.usuario.tipo === 'autonomo' ? 'autonomos' : 'usuarios';
+      const { data: remet } = await supabase.from(tabelaRemetente).select('nome').eq('id', req.usuario.id).single();
+      const remetente = remet?.nome || 'Nova mensagem';
       enviarPush(dest.push_token, `💬 ${remetente}`, texto.trim().slice(0,100), { tipo: 'mensagem', de_id: req.usuario.id });
     }
   } catch {}
@@ -503,6 +587,9 @@ app.post('/mensagens', autenticar, async (req, res) => {
 app.get('/mensagens/:outro_id', autenticar, async (req, res) => {
   const meuId   = req.usuario.id;
   const outroId = req.params.outro_id;
+
+  // Validar que outroId é um UUID válido antes de usar no filtro .or()
+  if (!ehUUID(outroId)) return res.status(400).json({ erro: 'ID inválido.' });
 
   const { data, error } = await supabase
     .from('mensagens')
@@ -540,24 +627,36 @@ app.get('/conversas', autenticar, async (req, res) => {
 
   if (error) return res.status(500).json({ erro: error.message });
 
+  // Agrupar pela conversa (última mensagem de cada par)
   const conversas = {};
   (data || []).forEach(m => {
     const outroId = m.de_id === meuId ? m.para_id : m.de_id;
-    if (!conversas[outroId]) conversas[outroId] = m;
+    if (!conversas[outroId]) {
+      const outroTipo = m.de_id === meuId ? m.para_tipo : m.de_tipo;
+      conversas[outroId] = { ...m, outro_id: outroId, outro_tipo: outroTipo };
+    }
   });
 
-  res.json(Object.values(conversas));
-});
+  // Buscar o nome de cada participante (separa por tabela)
+  const lista = Object.values(conversas);
+  const idsUsuarios = lista.filter(c => c.outro_tipo !== 'autonomo').map(c => c.outro_id);
+  const idsAutonomos = lista.filter(c => c.outro_tipo === 'autonomo').map(c => c.outro_id);
 
-app.get('/mensagens/nao-lidas/count', autenticar, async (req, res) => {
-  const { count } = await supabase
-    .from('mensagens')
-    .select('*', { count: 'exact', head: true })
-    .eq('para_id', req.usuario.id)
-    .eq('lida', false);
-  res.json({ total: count || 0 });
-});
+  const nomes = {};
+  if (idsUsuarios.length) {
+    const { data: us } = await supabase.from('usuarios').select('id, nome').in('id', idsUsuarios);
+    (us || []).forEach(u => { nomes[u.id] = u.nome; });
+  }
+  if (idsAutonomos.length) {
+    const { data: aus } = await supabase.from('autonomos').select('id, nome').in('id', idsAutonomos);
+    (aus || []).forEach(a => { nomes[a.id] = a.nome; });
+  }
 
+  // Anexar o nome em cada conversa
+  lista.forEach(c => { c.outro_nome = nomes[c.outro_id] || 'Usuário'; });
+
+  res.json(lista);
+});
 
 // ════════════════════════════════════════════════════════
 //  RECUPERAÇÃO DE SENHA
@@ -567,12 +666,22 @@ app.post('/recuperar-senha', async (req, res) => {
   if (!email) return res.status(400).json({ erro: 'Email obrigatório.' });
   const tabela = tipo === 'autonomo' ? 'autonomos' : 'usuarios';
   const { data } = await supabase.from(tabela).select('id, nome, email').eq('email', email).single();
-  if (!data) return res.json({ mensagem: 'Se o email existir, você receberá as instruções.' });
+
+  // Resposta sempre genérica (não revela se o email existe — boa prática de segurança)
+  const respostaGenerica = { mensagem: 'Se o email estiver cadastrado, você receberá as instruções em instantes.' };
+
+  if (!data) return res.json(respostaGenerica);
+
   const token = jwt.sign(
-    { id: data.id, tipo: tipo||'usuario', acao: 'recuperar_senha' },
+    { id: data.id, tipo: tipo || 'usuario', acao: 'recuperar_senha' },
     process.env.JWT_SECRET, { expiresIn: '1h' }
   );
-  res.json({ mensagem: 'Instruções enviadas!', token_dev: token });
+
+  // Link para a página web de redefinição (abre no navegador)
+  const link = `${APP_URL}/trampo-redefinir?token=${encodeURIComponent(token)}`;
+  await enviarEmail(data.email, 'Redefinição de senha — Trampo', emailRecuperacaoSenha(data.nome, link));
+
+  res.json(respostaGenerica);
 });
 
 app.post('/redefinir-senha', async (req, res) => {
@@ -635,6 +744,9 @@ app.post('/denuncias', autenticar, async (req, res) => {
 //  ASAAS — PAGAMENTOS
 // ════════════════════════════════════════════════════════
 
+// NOTA: a coluna 'pagarme_order_id' na tabela 'pedidos' é um nome legado;
+// ela guarda o ID da cobrança no Asaas (não tem relação com Pagar.me).
+// Mantida assim para não quebrar dados existentes no banco.
 const ASAAS_URL = 'https://api.asaas.com/v3';
 const ASAAS_KEY = process.env.ASAAS_API_KEY;
 const TAXA_ASAAS_PIX = 1.98; // Taxa fixa por cobrança Pix (Pix + mensageria)
@@ -683,18 +795,59 @@ async function transferirAutonomo(pedido) {
     console.log('Autônomo sem chave Pix — transferência não realizada');
     return;
   }
+
+  // ── TRAVA DE IDEMPOTÊNCIA ──
+  // Marca transferido=true ANTES de transferir, mas só se ainda estiver false.
+  // Como é uma operação condicional no banco, dois processos simultâneos não
+  // conseguem ambos "ganhar" a trava — evita pagar o autônomo duas vezes.
+  const { data: trava, error: travaErr } = await supabase
+    .from('pedidos')
+    .update({ transferido: true, transferido_em: new Date().toISOString() })
+    .eq('id', pedido.id)
+    .eq('transferido', false)   // só atualiza se ainda não foi transferido
+    .select();
+
+  if (travaErr) { console.log('Erro ao travar transferência:', travaErr.message); return; }
+  if (!trava || trava.length === 0) {
+    console.log(`Pedido ${pedido.id} já foi transferido (ou trava não pegou) — ignorando`);
+    return; // outro processo já está cuidando / já foi pago
+  }
+
   try {
     const valor = parseFloat((pedido.valor_servico * 0.9).toFixed(2));
-    if (valor < 1) { console.log('Valor insuficiente para transferência'); return; }
+    if (valor < 1) {
+      console.log('Valor insuficiente para transferência');
+      // libera a trava (não havia o que transferir)
+      await supabase.from('pedidos').update({ transferido: false, transferido_em: null }).eq('id', pedido.id);
+      return;
+    }
+
+    // Verificar se há saldo disponível na conta Asaas.
+    // (No cartão o dinheiro pode levar até 2 dias úteis pra ficar disponível,
+    //  mesmo com antecipação. Se não houver saldo, libera a trava e o retry
+    //  a cada 2h tenta de novo quando o dinheiro cair.)
+    try {
+      const saldo = await asaasReq('GET', '/finance/balance');
+      const disponivel = parseFloat(saldo?.balance ?? 0);
+      if (disponivel < valor) {
+        console.log(`Saldo insuficiente (R$${disponivel}) para transferir R$${valor} — pedido ${pedido.id}. Retry tentará depois.`);
+        await supabase.from('pedidos').update({ transferido: false, transferido_em: null }).eq('id', pedido.id);
+        return;
+      }
+    } catch (e) {
+      // Se a checagem de saldo falhar, não bloqueia — segue e deixa o Asaas validar.
+      console.log('Não foi possível checar saldo (seguindo mesmo assim):', e.message);
+    }
+
     const chave = pedido.autonomos.chave_pix.trim();
-    
+
     // Detectar tipo da chave Pix
     let pixAddressKeyType = 'EMAIL';
     const cpfRegex = /^[0-9]{11}$/;
     const cnpjRegex = /^[0-9]{14}$/;
     const telefoneRegex = /^[+]?[0-9]{10,13}$/;
     const chaveLimpa = chave.replace(/[^0-9]/g,'');
-    
+
     if (cpfRegex.test(chaveLimpa)) pixAddressKeyType = 'CPF';
     else if (cnpjRegex.test(chaveLimpa)) pixAddressKeyType = 'CNPJ';
     else if (telefoneRegex.test(chave.replace(/[^0-9+]/g,''))) pixAddressKeyType = 'PHONE';
@@ -708,14 +861,14 @@ async function transferirAutonomo(pedido) {
       pixAddressKeyType,
       description: `Trampo - Pagamento pedido ${pedido.id}`,
     });
-    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome} (${pixAddressKeyType}: ${chave})`)
-    // Marcar como transferido no banco
-    await supabase.from('pedidos')
-      .update({ transferido: true, transferido_em: new Date().toISOString() })
-      .eq('id', pedido.id)
-      .catch(()=>{});;
+    console.log(`Transferido R$${valor} para ${pedido.autonomos.nome} (${pixAddressKeyType})`);
+    // Sucesso — a trava já marcou transferido=true, nada mais a fazer.
   } catch(e) {
     console.log('Erro transferência Asaas:', e.message);
+    // FALHOU — reverter a trava pra permitir nova tentativa pelo retry
+    await supabase.from('pedidos')
+      .update({ transferido: false, transferido_em: null })
+      .eq('id', pedido.id);
   }
 }
 
@@ -788,11 +941,29 @@ app.post('/pagamentos/cartao', autenticar, async (req, res) => {
 });
 
 app.post('/pagamentos/webhook', async (req, res) => {
+  // Validação de autenticidade: o Asaas envia o token configurado no painel
+  // no header 'asaas-access-token'. Configure ASAAS_WEBHOOK_TOKEN no Railway
+  // com o mesmo valor cadastrado no Asaas (Configurações → Webhooks).
+  const tokenRecebido = req.headers['asaas-access-token'];
+  if (process.env.ASAAS_WEBHOOK_TOKEN && tokenRecebido !== process.env.ASAAS_WEBHOOK_TOKEN) {
+    console.warn('[webhook] Token inválido — requisição rejeitada');
+    return res.status(401).json({ erro: 'Não autorizado.' });
+  }
+
   const { event, payment } = req.body;
   console.log('Webhook Asaas:', event, payment?.id);
   if (event === 'PAYMENT_RECEIVED' || event === 'PAYMENT_CONFIRMED') {
     const pedidoId = payment?.externalReference;
     if (pedidoId) {
+      // Proteção contra webhook duplicado: gateways reenviam o mesmo evento.
+      // Só processa se o pedido ainda não estiver em_andamento (evita push duplo).
+      const { data: jaProcessado } = await supabase
+        .from('pedidos').select('status').eq('id', pedidoId).single();
+      if (jaProcessado?.status === 'em_andamento' || jaProcessado?.status === 'concluido') {
+        console.log(`Webhook ignorado — pedido ${pedidoId} já está ${jaProcessado.status}`);
+        return res.json({ ok: true, ja_processado: true });
+      }
+
       await supabase.from('pedidos').update({ status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedidoId);
 
       // Notificar o autônomo que recebeu um pedido pago
@@ -815,6 +986,7 @@ app.post('/pagamentos/webhook', async (req, res) => {
 });
 
 app.get('/pagamentos/status/:pedido_id', autenticar, async (req, res) => {
+  if (!ehUUID(req.params.pedido_id)) return res.status(400).json({ erro: 'ID inválido.' });
   const { data: pedido } = await supabase.from('pedidos').select('status, pagarme_order_id, pago_em').eq('id', req.params.pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
   if (pedido.pagarme_order_id && pedido.status === 'aguardando_pagamento') {
@@ -928,87 +1100,6 @@ app.get('/avaliacoes/minhas', autenticar, async (req, res) => {
 });
 
 
-app.post('/pagamentos/cartao', autenticar, async (req, res) => {
-  const { pedido_id, card_number, card_holder_name, card_expiration_month,
-          card_expiration_year, card_cvv, installments, valor_total } = req.body;
-
-  if (!pedido_id || !card_number) return res.status(400).json({ erro: 'Dados incompletos.' });
-
-  const { data: pedido } = await supabase
-    .from('pedidos').select('*, usuarios(*)').eq('id', pedido_id).single();
-  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
-
-  try {
-    // 1. Tokenizar o cartão
-    const tokenRes = await fetch('https://api.mercadopago.com/v1/card_tokens', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-      },
-      body: JSON.stringify({
-        card_number, card_holder_name,
-        card_expiration_month, card_expiration_year,
-        security_code: card_cvv,
-        cardholder: { name: card_holder_name },
-      })
-    });
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok) throw new Error(tokenData.message || 'Erro ao tokenizar cartão.');
-
-    // 2. Criar pagamento
-    const pagRes = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-        'X-Idempotency-Key': `cartao-${pedido_id}-${Date.now()}`,
-      },
-      body: JSON.stringify({
-        transaction_amount: parseFloat(valor_total),
-        token: tokenData.id,
-        description: 'Serviço Trampo',
-        installments: parseInt(installments) || 1,
-        payment_method_id: 'visa', // MP detecta automaticamente
-        payer: {
-          email: pedido.usuarios.email,
-          first_name: pedido.usuarios.nome?.split(' ')[0] || 'Cliente',
-          last_name: pedido.usuarios.nome?.split(' ').slice(1).join(' ') || 'Trampo',
-        },
-        notification_url: `${process.env.API_URL || 'https://web-production-8a9e5.up.railway.app'}/pagamentos/webhook`,
-        metadata: { pedido_id },
-      })
-    });
-
-    const pagData = await pagRes.json();
-    if (!pagRes.ok) throw new Error(pagData.message || 'Erro ao processar pagamento.');
-
-    if (pagData.status === 'approved') {
-      await supabase.from('pedidos').update({
-        pagarme_order_id: String(pagData.id),
-        status: 'em_andamento',
-        pago_em: new Date().toISOString()
-      }).eq('id', pedido_id);
-      return res.json({ status: 'approved', mensagem: 'Pagamento aprovado!' });
-    }
-
-    if (pagData.status === 'in_process' || pagData.status === 'pending') {
-      await supabase.from('pedidos').update({
-        pagarme_order_id: String(pagData.id),
-        status: 'aguardando_pagamento',
-      }).eq('id', pedido_id);
-      return res.json({ status: 'pending', mensagem: 'Pagamento em análise.' });
-    }
-
-    throw new Error(pagData.status_detail || 'Pagamento recusado. Verifique os dados do cartão.');
-
-  } catch(e) {
-    console.error('Erro cartão:', e.message);
-    res.status(500).json({ erro: e.message });
-  }
-});
-
-
 app.patch('/orcamentos/:id/recusar', autenticar, async (req, res) => {
   const { data, error } = await supabase.from('orcamentos')
     .update({ status: 'recusado' })
@@ -1076,8 +1167,8 @@ app.post('/pedidos/:id/disputa', autenticar, async (req, res) => {
   const ehAutonomo = pedido.autonomo_id === req.usuario.id;
   if (!ehCliente && !ehAutonomo) return res.status(403).json({ erro: 'Sem permissão.' });
 
-  // Só em pedidos pagos / em andamento
-  if (!['em_andamento','aguardando_pagamento'].includes(pedido.status)) {
+  // Só em pedidos pagos / em andamento (precisa ter dinheiro retido pra disputar)
+  if (pedido.status !== 'em_andamento') {
     return res.status(400).json({ erro: 'Só é possível abrir disputa em pedidos pagos e em andamento.' });
   }
 
@@ -1099,7 +1190,8 @@ app.post('/pedidos/:id/disputa', autenticar, async (req, res) => {
 
 // Listar disputas (para painel admin)
 app.get('/admin/disputas', async (req, res) => {
-  const { senha } = req.query;
+  // Aceita senha via header (preferido, não fica em logs de URL) ou query (fallback)
+  const senha = req.headers['x-admin-secret'] || req.query.senha;
   if (senha !== process.env.ADMIN_SECRET) return res.status(403).json({ erro: 'Sem permissão.' });
 
   const { data } = await supabase
@@ -1158,12 +1250,14 @@ app.post('/admin/disputas/:id/resolver', async (req, res) => {
     const pct = parseFloat(percentual_autonomo) || 50;
     const valorAutonomo = parseFloat((pedido.valor_servico * (pct/100)).toFixed(2));
 
-    // Transferir parte ao autônomo
+    // Transferir parte ao autônomo (transferirAutonomo cuida da trava transferido)
     if (pedido.autonomos?.chave_pix && valorAutonomo >= 1) {
       await transferirAutonomo({
         ...pedido,
         autonomos: pedido.autonomos,
-        valor_servico: pedido.valor_servico * (pct/100) / 0.9  // ajusta pra transferir o pct exato
+        // transferirAutonomo multiplica por 0.9; o /0.9 aqui cancela isso,
+        // resultando em transferir exatamente (valor * pct/100) ao autônomo
+        valor_servico: pedido.valor_servico * (pct/100) / 0.9
       });
     }
 
@@ -1171,8 +1265,8 @@ app.post('/admin/disputas/:id/resolver', async (req, res) => {
       status: 'concluido',
       concluido_em: new Date().toISOString(),
       disputa_resolucao: `dividido_${pct}`,
-      disputa_resolvido_em: new Date().toISOString(),
-      transferido: true
+      disputa_resolvido_em: new Date().toISOString()
+      // 'transferido' é controlado pela própria transferirAutonomo (trava de idempotência)
     }).eq('id', req.params.id);
 
     return res.json({ mensagem: `Disputa resolvida: ${pct}% liberado ao autônomo (R$ ${valorAutonomo.toFixed(2)}).` });
@@ -1193,10 +1287,16 @@ app.post('/admin/liberar/:pedido_id', async (req, res) => {
   await supabase.from('pedidos').update({
     status: 'concluido',
     concluido_em: new Date().toISOString(),
-    liberado_admin: true
+    liberado_admin: true,
+    transferido: false
   }).eq('id', req.params.pedido_id);
 
-  res.json({ mensagem: `Pedido ${req.params.pedido_id} liberado pelo admin.` });
+  // Transferir ao autônomo (transferirAutonomo cuida da trava de idempotência)
+  if (pedido.autonomos?.chave_pix) {
+    await transferirAutonomo({ ...pedido, autonomos: pedido.autonomos, transferido: false });
+  }
+
+  res.json({ mensagem: `Pedido ${req.params.pedido_id} liberado pelo admin e pagamento transferido ao autônomo.` });
 });
 
 
@@ -1215,6 +1315,54 @@ app.put('/usuarios/perfil', autenticar, async (req, res) => {
     .eq('id', req.usuario.id);
   if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Perfil atualizado!' });
+});
+
+
+// ════════════════════════════════════════════════════════
+//  EXCLUSÃO DE CONTA (LGPD / Google Play)
+//  Anonimiza os dados pessoais imediatamente (em vez de
+//  deletar a linha, o que quebraria pedidos vinculados que
+//  precisam ser mantidos por obrigação fiscal) e remove
+//  mensagens. Funciona para cliente e autônomo.
+// ════════════════════════════════════════════════════════
+
+app.delete('/conta', autenticar, async (req, res) => {
+  const id = req.usuario.id;
+  const ehAutonomo = req.usuario.tipo === 'autonomo';
+  const tabela = ehAutonomo ? 'autonomos' : 'usuarios';
+
+  try {
+    // 1. Apagar mensagens enviadas e recebidas
+    await supabase.from('mensagens').delete().or(`de_id.eq.${id},para_id.eq.${id}`);
+
+    // 2. Autônomo: apagar os serviços oferecidos
+    if (ehAutonomo) {
+      await supabase.from('servicos').delete().eq('autonomo_id', id);
+    }
+
+    // 3. Anonimizar dados pessoais (LGPD)
+    const dadosAnonimos = {
+      nome: 'Conta excluída',
+      email: `excluido_${id}@trampo.invalid`,
+      senha_hash: 'CONTA_EXCLUIDA',
+      telefone: null,
+      cpf: null,
+      push_token: null,
+    };
+    if (ehAutonomo) {
+      Object.assign(dadosAnonimos, {
+        chave_pix: null,
+        bio: null,
+        ativo: false,
+      });
+    }
+    const { error } = await supabase.from(tabela).update(dadosAnonimos).eq('id', id);
+    if (error) return res.status(500).json({ erro: error.message });
+
+    res.json({ mensagem: 'Conta excluída com sucesso.' });
+  } catch (e) {
+    res.status(500).json({ erro: 'Erro ao excluir conta. Tente novamente.' });
+  }
 });
 
 
@@ -1291,9 +1439,9 @@ app.post('/push-token', autenticar, async (req, res) => {
   const { push_token } = req.body;
   if (!push_token) return res.status(400).json({ erro: 'push_token obrigatorio.' });
 
-  // Tenta atualizar tanto em usuarios quanto em autonomos
-  await supabase.from('usuarios').update({ push_token }).eq('id', req.usuario.id).catch(()=>{});
-  await supabase.from('autonomos').update({ push_token }).eq('id', req.usuario.id).catch(()=>{});
+  // Atualizar na tabela correta conforme o tipo do usuário
+  const tabela = req.usuario.tipo === 'autonomo' ? 'autonomos' : 'usuarios';
+  await supabase.from(tabela).update({ push_token }).eq('id', req.usuario.id);
 
   res.json({ mensagem: 'Token salvo!' });
 });
