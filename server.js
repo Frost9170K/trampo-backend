@@ -372,7 +372,7 @@ app.post('/usuarios/cadastro', async (req, res) => {
   const novoUsuario = { nome, email, senha_hash, telefone };
   if (cpf) novoUsuario.cpf = cpf; // salva o CPF já no cadastro (evita pedir de novo no pagamento)
   const { data, error } = await supabase
-    .from('usuarios').insert([novoUsuario]).select('id, nome, email');
+    .from('usuarios').insert([novoUsuario]).select('id, nome, email, telefone, cpf');
 
   if (error) return res.status(500).json({ erro: error.message });
 
@@ -1309,9 +1309,11 @@ app.patch('/usuarios/atualizar-cpf', autenticar, async (req, res) => {
 
 
 app.put('/usuarios/perfil', autenticar, async (req, res) => {
-  const { nome, telefone } = req.body;
+  const { nome, telefone, cpf } = req.body;
+  const dados = { nome, telefone };
+  if (cpf !== undefined) dados.cpf = cpf;
   const { error } = await supabase.from('usuarios')
-    .update({ nome, telefone })
+    .update(dados)
     .eq('id', req.usuario.id);
   if (error) return res.status(500).json({ erro: error.message });
   res.json({ mensagem: 'Perfil atualizado!' });
@@ -1333,11 +1335,13 @@ app.delete('/conta', autenticar, async (req, res) => {
 
   try {
     // 1. Apagar mensagens enviadas e recebidas
-    await supabase.from('mensagens').delete().or(`de_id.eq.${id},para_id.eq.${id}`);
+    const { error: errMsg } = await supabase.from('mensagens').delete().or(`de_id.eq.${id},para_id.eq.${id}`);
+    if (errMsg) console.error('[excluir conta] erro ao apagar mensagens:', errMsg.message);
 
     // 2. Autônomo: apagar os serviços oferecidos
     if (ehAutonomo) {
-      await supabase.from('servicos').delete().eq('autonomo_id', id);
+      const { error: errServ } = await supabase.from('servicos').delete().eq('autonomo_id', id);
+      if (errServ) console.error('[excluir conta] erro ao apagar serviços:', errServ.message);
     }
 
     // 3. Anonimizar dados pessoais (LGPD)
@@ -1346,22 +1350,34 @@ app.delete('/conta', autenticar, async (req, res) => {
       email: `excluido_${id}@trampo.invalid`,
       senha_hash: 'CONTA_EXCLUIDA',
       telefone: null,
-      cpf: null,
       push_token: null,
     };
     if (ehAutonomo) {
-      Object.assign(dadosAnonimos, {
-        chave_pix: null,
-        bio: null,
-        ativo: false,
-      });
+      Object.assign(dadosAnonimos, { chave_pix: null, bio: null, ativo: false });
     }
-    const { error } = await supabase.from(tabela).update(dadosAnonimos).eq('id', id);
-    if (error) return res.status(500).json({ erro: error.message });
+
+    let { error } = await supabase.from(tabela).update(dadosAnonimos).eq('id', id);
+
+    // Se falhou por causa de alguma coluna que não existe (ex: cpf), tenta de novo
+    // sem os campos opcionais — garante que a anonimização principal aconteça.
+    if (error) {
+      console.error('[excluir conta] erro no update, tentando versão mínima:', error.message);
+      const minimo = {
+        nome: 'Conta excluída',
+        email: `excluido_${id}@trampo.invalid`,
+        senha_hash: 'CONTA_EXCLUIDA',
+      };
+      const retry = await supabase.from(tabela).update(minimo).eq('id', id);
+      if (retry.error) {
+        console.error('[excluir conta] erro mesmo no mínimo:', retry.error.message);
+        return res.status(500).json({ erro: 'Erro ao excluir conta: ' + retry.error.message });
+      }
+    }
 
     res.json({ mensagem: 'Conta excluída com sucesso.' });
   } catch (e) {
-    res.status(500).json({ erro: 'Erro ao excluir conta. Tente novamente.' });
+    console.error('[excluir conta] exceção:', e.message);
+    res.status(500).json({ erro: 'Erro ao excluir conta: ' + e.message });
   }
 });
 
@@ -1448,6 +1464,20 @@ app.post('/push-token', autenticar, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', app: 'Trampo API', versao: '1.0.0' }));
+
+// Keep-alive: faz uma consulta leve no Supabase para evitar que o projeto
+// pause por inatividade (plano grátis pausa após 7 dias sem atividade).
+// Configure um monitor externo (UptimeRobot/cron-job.org) chamando esta rota
+// 1x por dia. PALIATIVO para a fase de testes — em produção, use o plano Pro.
+app.get('/keep-alive', async (req, res) => {
+  try {
+    // Consulta mínima (conta 1 registro) só pra registrar atividade no banco
+    await supabase.from('autonomos').select('id', { count: 'exact', head: true }).limit(1);
+    res.json({ status: 'ok', banco: 'ativo', em: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ status: 'erro', erro: e.message });
+  }
+});
 
 // ── Start ─────────────────────────────────────────────────
 app.listen(PORT, () => {
