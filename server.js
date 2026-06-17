@@ -1340,39 +1340,55 @@ app.delete('/conta', autenticar, async (req, res) => {
     const { error: errMsg } = await supabase.from('mensagens').delete().or(`de_id.eq.${id},para_id.eq.${id}`);
     if (errMsg) console.error('[excluir conta] erro ao apagar mensagens:', errMsg.message);
 
-    // 2. Autônomo: apagar os serviços oferecidos
-    if (ehAutonomo) {
-      const { error: errServ } = await supabase.from('servicos').delete().eq('autonomo_id', id);
-      if (errServ) console.error('[excluir conta] erro ao apagar serviços:', errServ.message);
-    }
+    // 2. Autônomo: NÃO apagar serviços (têm pedidos vinculados por foreign key).
+    //    Como a conta é anonimizada e fica inativa, os serviços deixam de aparecer.
+    //    (Tentar apagar violaria a constraint pedidos_servico_id_fkey.)
 
-    // 3. Anonimizar dados pessoais (LGPD)
+    // 3. Anonimizar dados pessoais (LGPD).
+    //    Usamos strings vazias/placeholder em vez de null porque algumas colunas
+    //    (ex: telefone) são NOT NULL e rejeitariam null.
     const dadosAnonimos = {
       nome: 'Conta excluída',
       email: `excluido_${id}@trampo.invalid`,
       senha_hash: 'CONTA_EXCLUIDA',
-      telefone: null,
-      push_token: null,
+      telefone: '',
+      cpf: '',
     };
+    // push_token e cpf podem não existir como NOT NULL — incluímos com segurança
     if (ehAutonomo) {
-      Object.assign(dadosAnonimos, { chave_pix: null, bio: null, ativo: false });
+      Object.assign(dadosAnonimos, {
+        chave_pix: '',
+        bio: '',
+        ativo: false,
+      });
+    }
+    // Limpar push_token só se a coluna aceitar (tenta, mas não bloqueia)
+    const dadosComToken = { ...dadosAnonimos, push_token: null };
+
+    let { error } = await supabase.from(tabela).update(dadosComToken).eq('id', id);
+
+    // Se falhou (ex: push_token NOT NULL ou coluna inexistente), tenta sem push_token
+    if (error) {
+      console.error('[excluir conta] 1ª tentativa falhou, tentando sem push_token:', error.message);
+      const r2 = await supabase.from(tabela).update(dadosAnonimos).eq('id', id);
+      error = r2.error;
     }
 
-    let { error } = await supabase.from(tabela).update(dadosAnonimos).eq('id', id);
-
-    // Se falhou por causa de alguma coluna que não existe (ex: cpf), tenta de novo
-    // sem os campos opcionais — garante que a anonimização principal aconteça.
+    // Última tentativa: só o essencial (nome, email, senha)
     if (error) {
-      console.error('[excluir conta] erro no update, tentando versão mínima:', error.message);
+      console.error('[excluir conta] 2ª tentativa falhou, tentando mínimo:', error.message);
       const minimo = {
         nome: 'Conta excluída',
         email: `excluido_${id}@trampo.invalid`,
         senha_hash: 'CONTA_EXCLUIDA',
+        ativo: ehAutonomo ? false : undefined,
       };
-      const retry = await supabase.from(tabela).update(minimo).eq('id', id);
-      if (retry.error) {
-        console.error('[excluir conta] erro mesmo no mínimo:', retry.error.message);
-        return res.status(500).json({ erro: 'Erro ao excluir conta: ' + retry.error.message });
+      // remove chaves undefined
+      Object.keys(minimo).forEach(k => minimo[k] === undefined && delete minimo[k]);
+      const r3 = await supabase.from(tabela).update(minimo).eq('id', id);
+      if (r3.error) {
+        console.error('[excluir conta] erro mesmo no mínimo:', r3.error.message);
+        return res.status(500).json({ erro: 'Erro ao excluir conta: ' + r3.error.message });
       }
     }
 
