@@ -129,7 +129,7 @@ app.post('/pre-cadastro', async (req, res) => {
 app.post('/autonomos/cadastro', async (req, res) => {
   const { nome, email, senha, telefone, bairro,
           categoria, especialidade, bio, preco_medio,
-          disponibilidade, lat, lng, cpf, cidade } = req.body;
+          disponibilidade, lat, lng, cpf, cidade, chave_pix } = req.body;
 
   if (!nome || !email || !senha || !telefone || !categoria) {
     return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
@@ -153,8 +153,9 @@ app.post('/autonomos/cadastro', async (req, res) => {
                categoria, especialidade, bio, preco_medio,
                disponibilidade, lat, lng, localizacao,
                ...(cpf ? { cpf } : {}),
-               ...(cidade ? { cidade } : {}) }])
-    .select('id, nome, email, categoria');
+               ...(cidade ? { cidade } : {}),
+               ...(chave_pix ? { chave_pix } : {}) }])
+    .select('id, nome, email, categoria, telefone, bairro, chave_pix');
 
   if (error) return res.status(500).json({ erro: error.message });
 
@@ -210,6 +211,7 @@ app.get('/autonomos', async (req, res) => {
     .from('autonomos')
     .select('id, nome, categoria, especialidade, bairro, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo')
     .eq('ativo', true)
+    .neq('senha_hash', 'CONTA_EXCLUIDA')   // esconde contas excluídas/anonimizadas
     .order('nota_media', { ascending: false });
 
   if (categoria) query = query.eq('categoria', categoria);
