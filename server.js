@@ -100,13 +100,36 @@ function ehUUID(valor) {
   return typeof valor === 'string' && UUID_REGEX.test(valor);
 }
 
+// Converte data brasileira "DD/MM/AAAA" para ISO "AAAA-MM-DD" (formato do banco).
+// Se já vier em outro formato, devolve como está.
+function brParaISO(d) {
+  if (typeof d === 'string') {
+    const m = d.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  }
+  return d || null;
+}
+
+// Valida data brasileira DD/MM/AAAA (precisa ser uma data real, ex: rejeita 31/02)
+const TURNOS_VALIDOS = ['manha', 'tarde', 'noite'];
+function dataBRValida(str) {
+  const m = (str||'').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return false;
+  const dia=+m[1], mes=+m[2], ano=+m[3];
+  const d = new Date(ano, mes-1, dia);
+  return d.getFullYear()===ano && d.getMonth()===mes-1 && d.getDate()===dia;
+}
+function horaValida(str) {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(str||'');
+}
+
 // ════════════════════════════════════════════════════════
 //  PRÉ-CADASTRO (formulário de divulgação)
 // ════════════════════════════════════════════════════════
 app.post('/pre-cadastro', async (req, res) => {
   const { nome, email, telefone, cidade, bairro, categoria,
           especialidade, preco_medio, disponibilidade,
-          bio, como_soube } = req.body;
+          bio, como_soube, sistema } = req.body;
 
   if (!nome || !telefone || !bairro || !categoria) {
     return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
@@ -116,7 +139,8 @@ app.post('/pre-cadastro', async (req, res) => {
     .from('pre_cadastros')
     .insert([{ nome, email, telefone, cidade, bairro, categoria,
                especialidade, preco_medio, disponibilidade,
-               bio, como_soube }])
+               bio, como_soube,
+               ...(sistema ? { sistema } : {}) }])
     .select();
 
   if (error) return res.status(500).json({ erro: error.message });
@@ -397,8 +421,21 @@ app.post('/usuarios/login', async (req, res) => {
 //  PEDIDOS
 // ════════════════════════════════════════════════════════
 app.post('/pedidos', autenticar, async (req, res) => {
-  const { autonomo_id, servico_id, descricao, data_agendada, observacao, metodo_pagamento, data_agendamento, hora_agendamento, endereco_servico } = req.body;
+  const { autonomo_id, servico_id, descricao, observacao, metodo_pagamento, endereco_servico, opcoes_horario } = req.body;
   if (!autonomo_id || !servico_id) return res.status(400).json({ erro: 'Dados do serviço obrigatórios.' });
+
+  // Validar as 3 opções de horário (data + turno)
+  if (!Array.isArray(opcoes_horario) || opcoes_horario.length !== 3) {
+    return res.status(400).json({ erro: 'Informe 3 opções de data e turno.' });
+  }
+  for (const op of opcoes_horario) {
+    if (!op || !op.data || !op.turno) {
+      return res.status(400).json({ erro: 'Cada opção precisa de data e turno.' });
+    }
+    if (!dataBRValida(op.data)) return res.status(400).json({ erro: `Data inválida: ${op.data}. Use DD/MM/AAAA.` });
+    if (!TURNOS_VALIDOS.includes(op.turno)) return res.status(400).json({ erro: 'Turno inválido.' });
+  }
+  if (!endereco_servico) return res.status(400).json({ erro: 'Informe o local do serviço.' });
 
   // Busca preço do serviço
   const { data: servico } = await supabase
@@ -412,16 +449,197 @@ app.post('/pedidos', autenticar, async (req, res) => {
   const { data, error } = await supabase.from('pedidos').insert([{
     usuario_id:  req.usuario.id,
     autonomo_id, servico_id, descricao,
-    data_agendada: data_agendamento || data_agendada || null,
-    hora_agendamento: hora_agendamento || null,
     observacao: observacao || null,
-    endereco_servico: endereco_servico || null,
+    endereco_servico,
     metodo_pagamento: metodo_pagamento || 'pix',
-    valor_servico, taxa_plataforma, valor_total
+    valor_servico, taxa_plataforma, valor_total,
+    status: 'aguardando_confirmacao',   // novo fluxo: aguarda o autônomo responder
+    opcoes_horario,
+    proposto_por: 'cliente',            // o cliente fez a 1ª proposta
   }]).select();
 
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar o autônomo da nova solicitação
+  try {
+    const { data: aut } = await supabase.from('autonomos').select('push_token, nome').eq('id', autonomo_id).single();
+    const { data: cli } = await supabase.from('usuarios').select('nome').eq('id', req.usuario.id).single();
+    if (aut?.push_token) {
+      enviarPush(aut.push_token, '🔔 Nova solicitação de serviço',
+        `${cli?.nome || 'Um cliente'} quer agendar um serviço com você. Veja os horários e responda!`,
+        { tipo: 'solicitacao', pedido_id: data[0].id });
+    }
+  } catch {}
+
   res.status(201).json({ pedido: data[0] });
+});
+
+// ── Autônomo responde à solicitação ───────────────────────
+// Opção A: aceita uma das opções do cliente e crava o horário exato
+app.post('/pedidos/:id/aceitar-opcao', autenticar, async (req, res) => {
+  if (!ehUUID(req.params.id)) return res.status(400).json({ erro: 'ID inválido.' });
+  const { opcao_index, horario } = req.body; // qual das 3 opções (0,1,2) + hora exata "09:30"
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, usuarios(push_token, nome)').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.autonomo_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (pedido.status !== 'aguardando_confirmacao') return res.status(400).json({ erro: 'Este pedido não está aguardando confirmação.' });
+  if (pedido.proposto_por !== 'cliente') return res.status(400).json({ erro: 'Aguardando resposta do cliente.' });
+
+  const opcoes = pedido.opcoes_horario || [];
+  const escolhida = opcoes[opcao_index];
+  if (!escolhida) return res.status(400).json({ erro: 'Opção inválida.' });
+  if (!horaValida(horario)) return res.status(400).json({ erro: 'Horário inválido. Use HH:MM, ex: 14:30.' });
+
+  const { error } = await supabase.from('pedidos').update({
+    status: 'aguardando_pagamento',
+    data_turno_confirmado: escolhida,
+    horario_confirmado: horario,
+    data_agendada: brParaISO(escolhida.data),
+    hora_agendamento: horario,
+  }).eq('id', req.params.id).eq('status', 'aguardando_confirmacao');
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar o cliente que foi aceito e precisa pagar
+  try {
+    if (pedido.usuarios?.push_token) {
+      enviarPush(pedido.usuarios.push_token, '✅ Solicitação aceita!',
+        'O profissional confirmou um horário. Finalize o pagamento para agendar.',
+        { tipo: 'aceito', pedido_id: pedido.id });
+    }
+  } catch {}
+
+  res.json({ mensagem: 'Opção aceita. Aguardando pagamento do cliente.' });
+});
+
+// Opção B: propõe 3 novas opções (contraproposta) — vale pros dois lados
+app.post('/pedidos/:id/propor-opcoes', autenticar, async (req, res) => {
+  if (!ehUUID(req.params.id)) return res.status(400).json({ erro: 'ID inválido.' });
+  const { opcoes_horario } = req.body;
+
+  if (!Array.isArray(opcoes_horario) || opcoes_horario.length !== 3) {
+    return res.status(400).json({ erro: 'Informe 3 opções de data e turno.' });
+  }
+  for (const op of opcoes_horario) {
+    if (!op || !op.data || !op.turno) return res.status(400).json({ erro: 'Cada opção precisa de data e turno.' });
+    if (!dataBRValida(op.data)) return res.status(400).json({ erro: `Data inválida: ${op.data}. Use DD/MM/AAAA.` });
+    if (!TURNOS_VALIDOS.includes(op.turno)) return res.status(400).json({ erro: 'Turno inválido.' });
+    if (op.horario && !horaValida(op.horario)) return res.status(400).json({ erro: `Horário inválido: ${op.horario}. Use HH:MM.` });
+  }
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, usuarios(push_token, nome), autonomos(push_token, nome)').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.status !== 'aguardando_confirmacao') return res.status(400).json({ erro: 'Este pedido não está em negociação.' });
+
+  // Descobrir quem está propondo (tem que ser o lado oposto ao último proponente)
+  const ehCliente  = pedido.usuario_id === req.usuario.id;
+  const ehAutonomo = pedido.autonomo_id === req.usuario.id;
+  if (!ehCliente && !ehAutonomo) return res.status(403).json({ erro: 'Sem permissão.' });
+
+  const quemPropoe = ehCliente ? 'cliente' : 'autonomo';
+  if (pedido.proposto_por === quemPropoe) {
+    return res.status(400).json({ erro: 'Você já propôs. Aguarde a resposta do outro lado.' });
+  }
+
+  // Quando o AUTÔNOMO propõe, cada opção precisa do horário exato
+  // (ele conhece a própria agenda — assim o cliente escolhe e já fica agendado)
+  if (quemPropoe === 'autonomo') {
+    for (const op of opcoes_horario) {
+      if (!op.horario) return res.status(400).json({ erro: 'Informe o horário exato de cada opção.' });
+    }
+  }
+
+  const { error } = await supabase.from('pedidos').update({
+    opcoes_horario,
+    proposto_por: quemPropoe,
+  }).eq('id', req.params.id).eq('status', 'aguardando_confirmacao');
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar o outro lado
+  try {
+    const alvo = ehCliente ? pedido.autonomos : pedido.usuarios;
+    const nome = ehCliente ? pedido.usuarios?.nome : pedido.autonomos?.nome;
+    if (alvo?.push_token) {
+      enviarPush(alvo.push_token, '🔄 Novos horários propostos',
+        `${nome || 'A outra parte'} sugeriu novos horários. Veja se algum funciona!`,
+        { tipo: 'contraproposta', pedido_id: pedido.id });
+    }
+  } catch {}
+
+  res.json({ mensagem: 'Novas opções enviadas.' });
+});
+
+// Cliente aceita uma das opções propostas pelo autônomo (contraproposta)
+app.post('/pedidos/:id/cliente-aceitar-opcao', autenticar, async (req, res) => {
+  if (!ehUUID(req.params.id)) return res.status(400).json({ erro: 'ID inválido.' });
+  const { opcao_index } = req.body;
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, autonomos(push_token, nome)').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (pedido.status !== 'aguardando_confirmacao') return res.status(400).json({ erro: 'Este pedido não está aguardando confirmação.' });
+  if (pedido.proposto_por !== 'autonomo') return res.status(400).json({ erro: 'Aguardando resposta do profissional.' });
+
+  const opcoes = pedido.opcoes_horario || [];
+  const escolhida = opcoes[opcao_index];
+  if (!escolhida) return res.status(400).json({ erro: 'Opção inválida.' });
+
+  const { error } = await supabase.from('pedidos').update({
+    status: 'aguardando_pagamento',
+    data_turno_confirmado: escolhida,
+    horario_confirmado: escolhida.horario || null,
+    data_agendada: brParaISO(escolhida.data),
+    hora_agendamento: escolhida.horario || null,
+  }).eq('id', req.params.id).eq('status', 'aguardando_confirmacao');
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar o autônomo que o cliente escolheu (falta só o pagamento)
+  try {
+    if (pedido.autonomos?.push_token) {
+      enviarPush(pedido.autonomos.push_token, '✅ Cliente escolheu um horário!',
+        'Assim que o pagamento for confirmado, o serviço estará agendado.',
+        { tipo: 'cliente_aceitou', pedido_id: pedido.id });
+    }
+  } catch {}
+
+  res.json({ mensagem: 'Horário confirmado. Finalize o pagamento para agendar.' });
+});
+
+// Recusar a solicitação (cancela, sem dinheiro envolvido pois ainda não pagou)
+app.post('/pedidos/:id/recusar', autenticar, async (req, res) => {
+  if (!ehUUID(req.params.id)) return res.status(400).json({ erro: 'ID inválido.' });
+  const { data: pedido } = await supabase
+    .from('pedidos').select('*, usuarios(push_token), autonomos(push_token)').eq('id', req.params.id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+
+  const ehCliente  = pedido.usuario_id === req.usuario.id;
+  const ehAutonomo = pedido.autonomo_id === req.usuario.id;
+  if (!ehCliente && !ehAutonomo) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (pedido.status !== 'aguardando_confirmacao') return res.status(400).json({ erro: 'Não é possível recusar este pedido.' });
+
+  const { error } = await supabase.from('pedidos').update({
+    status: 'cancelado',
+    cancelado_em: new Date().toISOString(),
+  }).eq('id', req.params.id).eq('status', 'aguardando_confirmacao');
+
+  if (error) return res.status(500).json({ erro: error.message });
+
+  // Notificar o outro lado
+  try {
+    const alvo = ehCliente ? pedido.autonomos : pedido.usuarios;
+    if (alvo?.push_token) {
+      enviarPush(alvo.push_token, 'Solicitação cancelada',
+        'A solicitação de serviço foi cancelada.', { tipo: 'cancelado', pedido_id: pedido.id });
+    }
+  } catch {}
+
+  res.json({ mensagem: 'Solicitação recusada/cancelada.' });
 });
 
 // ── Confirmar conclusão (libera pagamento) ────────────────
@@ -882,6 +1100,9 @@ app.post('/pagamentos/pix', autenticar, async (req, res) => {
     .from('pedidos').select('*, usuarios(*), servicos(*)')
     .eq('id', pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+  // Novo fluxo: só paga depois que o horário foi confirmado
+  if (pedido.status !== 'aguardando_pagamento')
+    return res.status(400).json({ erro: 'Este pedido ainda não está pronto para pagamento. Aguarde a confirmação do horário.' });
 
   try {
     const usuario = { ...pedido.usuarios, cpf: pedido.usuarios.cpf || cpf_temp };
@@ -902,43 +1123,41 @@ app.post('/pagamentos/pix', autenticar, async (req, res) => {
   }
 });
 
-app.post('/pagamentos/cartao', autenticar, async (req, res) => {
-  const { pedido_id, card_number, card_holder_name, card_expiration_month,
-          card_expiration_year, card_cvv, installments, valor_total } = req.body;
-  if (!pedido_id || !card_number) return res.status(400).json({ erro: 'Dados incompletos.' });
+// ── Pagamento com cartão via CHECKOUT DO ASAAS (link seguro) ──
+// Os dados do cartão são digitados na página do próprio Asaas (certificado
+// PCI-DSS) e NUNCA passam pelo nosso servidor. O webhook confirma o pagamento.
+app.post('/pagamentos/cartao-link', autenticar, async (req, res) => {
+  const { pedido_id } = req.body;
+  if (!pedido_id || !ehUUID(pedido_id)) return res.status(400).json({ erro: 'pedido_id inválido.' });
+
   const { data: pedido } = await supabase.from('pedidos').select('*, usuarios(*)').eq('id', pedido_id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido nao encontrado.' });
+  if (pedido.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  // Novo fluxo: só paga depois que o horário foi confirmado
+  if (pedido.status !== 'aguardando_pagamento')
+    return res.status(400).json({ erro: 'Este pedido ainda não está pronto para pagamento. Aguarde a confirmação do horário.' });
 
   try {
+    // Taxa de cartão (6,99%) calculada NO SERVIDOR — nunca confiar no valor vindo do app
+    const valorComTaxa = parseFloat((parseFloat(pedido.valor_total) * 1.0699).toFixed(2));
     const clienteId = await buscarOuCriarCliente(pedido.usuarios);
-    const parc = parseInt(installments) || 1;
+
     const cob = await asaasReq('POST', '/payments', {
-      customer: clienteId, billingType: 'CREDIT_CARD',
-      value: parseFloat(valor_total), dueDate: new Date().toISOString().split('T')[0],
-      description: 'Trampo - Servico', externalReference: pedido_id,
-      installmentCount: parc,
-      installmentValue: parseFloat((valor_total / parc).toFixed(2)),
-      creditCard: {
-        holderName: card_holder_name,
-        number: card_number.replace(/\s/g, ''),
-        expiryMonth: card_expiration_month,
-        expiryYear: card_expiration_year,
-        ccv: card_cvv,
-      },
-      creditCardHolderInfo: {
-        name: pedido.usuarios.nome, email: pedido.usuarios.email,
-        phone: (pedido.usuarios.telefone || '').replace(/[^0-9]/g, ''),
-        postalCode: '90000000', addressNumber: '1',
-      },
+      customer: clienteId,
+      billingType: 'CREDIT_CARD',
+      value: valorComTaxa,
+      dueDate: new Date().toISOString().split('T')[0],
+      description: `Trampo - Serviço (inclui taxa de cartão)`,
+      externalReference: pedido_id,
     });
-    if (cob.status === 'CONFIRMED' || cob.status === 'RECEIVED') {
-      await supabase.from('pedidos').update({ pagarme_order_id: cob.id, status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedido_id);
-      return res.json({ status: 'approved', mensagem: 'Pagamento aprovado!' });
-    }
-    throw new Error('Pagamento recusado. Verifique os dados do cartao.');
+
+    await supabase.from('pedidos').update({ pagarme_order_id: cob.id }).eq('id', pedido_id);
+
+    // invoiceUrl = página de pagamento hospedada pelo Asaas
+    res.json({ invoiceUrl: cob.invoiceUrl, valor: valorComTaxa });
   } catch(e) {
-    console.error('Asaas Cartao:', e.message);
-    res.status(500).json({ erro: e.message });
+    console.error('Asaas Cartao Link:', e.message);
+    res.status(500).json({ erro: 'Não foi possível gerar o link de pagamento. Tente novamente.' });
   }
 });
 
@@ -1007,10 +1226,23 @@ app.get('/pagamentos/status/:pedido_id', autenticar, async (req, res) => {
 // ════════════════════════════════════════════════════════
 
 app.post('/orcamentos', autenticar, async (req, res) => {
-  const { autonomo_id, descricao, categoria } = req.body;
+  const { autonomo_id, descricao, categoria, opcoes_horario, endereco_servico } = req.body;
   if (!autonomo_id || !descricao) return res.status(400).json({ erro: 'Campos obrigatorios faltando.' });
+
+  // Novo fluxo: 3 opções de data+turno + local obrigatórios
+  if (!Array.isArray(opcoes_horario) || opcoes_horario.length !== 3) {
+    return res.status(400).json({ erro: 'Informe 3 opções de data e turno.' });
+  }
+  for (const op of opcoes_horario) {
+    if (!op || !op.data || !op.turno) return res.status(400).json({ erro: 'Cada opção precisa de data e turno.' });
+    if (!dataBRValida(op.data)) return res.status(400).json({ erro: `Data inválida: ${op.data}. Use DD/MM/AAAA.` });
+    if (!TURNOS_VALIDOS.includes(op.turno)) return res.status(400).json({ erro: 'Turno inválido.' });
+  }
+  if (!endereco_servico) return res.status(400).json({ erro: 'Informe o local do serviço.' });
+
   const { data, error } = await supabase.from('orcamentos').insert([{
     usuario_id: req.usuario.id, autonomo_id, descricao, categoria,
+    opcoes_horario, endereco_servico,
     status: 'aguardando_resposta',
   }]).select();
   if (error) return res.status(500).json({ erro: error.message });
@@ -1029,10 +1261,18 @@ app.post('/orcamentos', autenticar, async (req, res) => {
 });
 
 app.patch('/orcamentos/:id/responder', autenticar, async (req, res) => {
-  const { valor, prazo, observacao } = req.body;
+  const { valor, prazo, observacao, data_turno_escolhido, horario } = req.body;
   if (!valor) return res.status(400).json({ erro: 'Valor obrigatorio.' });
+
+  // Novo fluxo: o autônomo escolhe uma das opções do cliente e crava o horário
+  if (!data_turno_escolhido || !data_turno_escolhido.data || !data_turno_escolhido.turno) {
+    return res.status(400).json({ erro: 'Escolha uma das opções de data do cliente.' });
+  }
+  if (!horaValida(horario)) return res.status(400).json({ erro: 'Horário inválido. Use HH:MM, ex: 14:30.' });
+
   const { data, error } = await supabase.from('orcamentos')
-    .update({ valor, prazo, observacao, status: 'respondido', respondido_em: new Date().toISOString() })
+    .update({ valor, prazo, observacao, data_turno_escolhido, horario_confirmado: horario,
+              status: 'respondido', respondido_em: new Date().toISOString() })
     .eq('id', req.params.id).eq('autonomo_id', req.usuario.id).select();
   if (error) return res.status(500).json({ erro: error.message });
 
@@ -1060,9 +1300,26 @@ app.post('/orcamentos/:id/aprovar', autenticar, async (req, res) => {
     usuario_id: req.usuario.id, autonomo_id: orc.autonomo_id,
     descricao: orc.descricao, valor_servico, taxa_plataforma,
     valor_total: valor_servico, status: 'aguardando_pagamento',
+    // Horário e local já acordados no orçamento
+    endereco_servico: orc.endereco_servico || null,
+    data_turno_confirmado: orc.data_turno_escolhido || null,
+    horario_confirmado: orc.horario_confirmado || null,
+    data_agendada: brParaISO(orc.data_turno_escolhido?.data),
+    hora_agendamento: orc.horario_confirmado || null,
   }]).select();
   if (error) return res.status(500).json({ erro: error.message });
   await supabase.from('orcamentos').update({ status: 'aprovado', pedido_id: pedido[0].id }).eq('id', orc.id);
+
+  // Notificar o autônomo que o orçamento foi aprovado
+  try {
+    const { data: aut } = await supabase.from('autonomos').select('push_token').eq('id', orc.autonomo_id).single();
+    if (aut?.push_token) {
+      enviarPush(aut.push_token, '🎉 Orçamento aprovado!',
+        'O cliente aprovou seu orçamento. Assim que o pagamento for confirmado, o serviço estará agendado.',
+        { tipo: 'orcamento_aprovado', pedido_id: pedido[0].id });
+    }
+  } catch {}
+
   res.status(201).json({ pedido: pedido[0] });
 });
 
@@ -1082,11 +1339,21 @@ app.patch('/pedidos/:id/cancelar', autenticar, async (req, res) => {
     .from('pedidos').select('*').eq('id', req.params.id).single();
   if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
   if (pedido.usuario_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
-  if (!['aguardando_pagamento'].includes(pedido.status))
-    return res.status(400).json({ erro: 'Só é possível cancelar pedidos aguardando pagamento.' });
+  if (!['aguardando_pagamento','aguardando_confirmacao'].includes(pedido.status))
+    return res.status(400).json({ erro: 'Só é possível cancelar pedidos que ainda não foram pagos.' });
   const { error } = await supabase.from('pedidos')
-    .update({ status: 'cancelado' }).eq('id', req.params.id);
+    .update({ status: 'cancelado', cancelado_em: new Date().toISOString() }).eq('id', req.params.id);
   if (error) return res.status(500).json({ erro: error.message });
+
+  // Avisar o autônomo (ele podia estar aguardando esse serviço)
+  try {
+    const { data: aut } = await supabase.from('autonomos').select('push_token').eq('id', pedido.autonomo_id).single();
+    if (aut?.push_token) {
+      enviarPush(aut.push_token, 'Solicitação cancelada',
+        'O cliente cancelou a solicitação de serviço.', { tipo: 'cancelado', pedido_id: pedido.id });
+    }
+  } catch {}
+
   res.json({ mensagem: 'Pedido cancelado.' });
 });
 
