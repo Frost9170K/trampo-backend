@@ -994,6 +994,7 @@ async function buscarOuCriarCliente(usuario) {
         await asaasReq('PUT', `/customers/${clienteExistente.id}`, {
           name: usuario.nome,
           cpfCnpj: cpfLimpo,
+          notificationDisabled: true,
         }).catch(e => console.log('Erro ao atualizar CPF:', e.message));
       }
       return clienteExistente.id;
@@ -1004,6 +1005,7 @@ async function buscarOuCriarCliente(usuario) {
     name: usuario.nome, email: usuario.email,
     phone: (usuario.telefone || '').replace(/[^0-9]/g, ''),
     groupName: 'Trampo',
+    notificationDisabled: true, // o app notifica por push — evita emails de cobrança do Asaas
   };
   if (cpfLimpo) body.cpfCnpj = cpfLimpo;
   const c = await asaasReq('POST', '/customers', body);
@@ -1183,6 +1185,12 @@ app.post('/pagamentos/webhook', async (req, res) => {
       if (jaProcessado?.status === 'em_andamento' || jaProcessado?.status === 'concluido') {
         console.log(`Webhook ignorado — pedido ${pedidoId} já está ${jaProcessado.status}`);
         return res.json({ ok: true, ja_processado: true });
+      }
+      if (jaProcessado?.status === 'cancelado') {
+        // Pagamento chegou para um pedido cancelado/expirado — não reativa.
+        // Se isso aparecer no log, o valor precisa ser estornado manualmente no Asaas.
+        console.warn(`⚠️ Webhook de pagamento para pedido CANCELADO ${pedidoId} — verificar estorno no Asaas!`);
+        return res.json({ ok: true, pedido_cancelado: true });
       }
 
       await supabase.from('pedidos').update({ status: 'em_andamento', pago_em: new Date().toISOString() }).eq('id', pedidoId);
@@ -1765,6 +1773,83 @@ app.get('/keep-alive', async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────
+// ── EXPIRAÇÃO AUTOMÁTICA DE PEDIDOS PARADOS ────────────────
+// Roda a cada 6 horas. Regras:
+// - aguardando_confirmacao há mais de 7 dias → expira (negociação abandonada)
+// - aguardando_pagamento com a data agendada já passada, ou criado há mais
+//   de 7 dias → expira (cliente não pagou)
+// Ao expirar: cancela a cobrança no Asaas (para de gerar emails e links pagáveis)
+// e avisa as partes por push.
+async function expirarPedidosParados() {
+  try {
+    const seteDiasAtras = new Date(Date.now() - 7*24*60*60*1000).toISOString();
+    const hojeISO = new Date().toISOString().split('T')[0];
+
+    // 1. Negociações abandonadas
+    const { data: negociacoes } = await supabase
+      .from('pedidos')
+      .select('id, usuario_id, autonomo_id, pagarme_order_id, usuarios(push_token), autonomos(push_token)')
+      .eq('status', 'aguardando_confirmacao')
+      .lt('criado_em', seteDiasAtras);
+
+    // 2. Aguardando pagamento vencidos (data do serviço passou OU 7+ dias parado)
+    const { data: naoPagosData } = await supabase
+      .from('pedidos')
+      .select('id, usuario_id, autonomo_id, pagarme_order_id, usuarios(push_token), autonomos(push_token)')
+      .eq('status', 'aguardando_pagamento')
+      .lt('data_agendada', hojeISO);
+    const { data: naoPagosVelhos } = await supabase
+      .from('pedidos')
+      .select('id, usuario_id, autonomo_id, pagarme_order_id, usuarios(push_token), autonomos(push_token)')
+      .eq('status', 'aguardando_pagamento')
+      .lt('criado_em', seteDiasAtras);
+
+    // Unificar sem duplicar
+    const vistos = new Set();
+    const expiraveis = [];
+    for (const lista of [negociacoes||[], naoPagosData||[], naoPagosVelhos||[]]) {
+      for (const p of lista) {
+        if (!vistos.has(p.id)) { vistos.add(p.id); expiraveis.push(p); }
+      }
+    }
+    if (expiraveis.length === 0) return;
+
+    for (const p of expiraveis) {
+      // Cancela com condição de status (não atropela um pagamento que acabou de cair)
+      const { error } = await supabase.from('pedidos')
+        .update({ status: 'cancelado', cancelado_em: new Date().toISOString() })
+        .eq('id', p.id)
+        .in('status', ['aguardando_confirmacao', 'aguardando_pagamento']);
+      if (error) continue;
+
+      // Cancela a cobrança correspondente no Asaas (evita pagamento de pedido morto)
+      if (p.pagarme_order_id) {
+        try { await asaasReq('DELETE', `/payments/${p.pagarme_order_id}`); } catch {}
+      }
+
+      // Avisa as partes
+      try {
+        if (p.usuarios?.push_token) {
+          enviarPush(p.usuarios.push_token, 'Solicitação expirada',
+            'Uma solicitação antiga expirou por falta de conclusão. Você pode fazer uma nova quando quiser!',
+            { tipo: 'expirado', pedido_id: p.id });
+        }
+        if (p.autonomos?.push_token) {
+          enviarPush(p.autonomos.push_token, 'Solicitação expirada',
+            'Uma solicitação antiga foi cancelada automaticamente por falta de conclusão.',
+            { tipo: 'expirado', pedido_id: p.id });
+        }
+      } catch {}
+    }
+    console.log(`🧹 Expiração automática: ${expiraveis.length} pedido(s) cancelado(s)`);
+  } catch (e) {
+    console.error('Erro na expiração automática:', e.message);
+  }
+}
+// Roda ao subir e depois a cada 6 horas
+expirarPedidosParados();
+setInterval(expirarPedidosParados, 6*60*60*1000);
+
 app.listen(PORT, () => {
   console.log(`\n🟢 Trampo API rodando em http://localhost:${PORT}`);
   console.log(`   Teste: http://localhost:${PORT}/ping\n`);
