@@ -1144,19 +1144,34 @@ app.post('/pagamentos/cartao-link', autenticar, async (req, res) => {
     const valorComTaxa = parseFloat((parseFloat(pedido.valor_total) * 1.0699).toFixed(2));
     const clienteId = await buscarOuCriarCliente(pedido.usuarios);
 
-    const cob = await asaasReq('POST', '/payments', {
-      customer: clienteId,
-      billingType: 'CREDIT_CARD',
-      value: valorComTaxa,
-      dueDate: new Date().toISOString().split('T')[0],
-      description: `Trampo - Serviço (inclui taxa de cartão)`,
+    // Asaas Checkout: página hospedada onde o cliente escolhe pagar
+    // à vista OU PARCELADO (até 12x) — como Mercado Pago. Os dados do
+    // cartão continuam 100% no ambiente do Asaas (PCI-DSS).
+    const cob = await asaasReq('POST', '/checkouts', {
+      billingTypes: ['CREDIT_CARD'],
+      chargeTypes: ['DETACHED', 'INSTALLMENT'],
+      minutesToExpire: 60,
+      installment: { maxInstallmentCount: 12 },
+      callback: {
+        successUrl: 'https://apptrampo.com.br',
+        cancelUrl: 'https://apptrampo.com.br',
+      },
+      items: [{
+        name: 'Serviço via Trampo',
+        description: 'Pagamento de serviço (inclui taxa de processamento do cartão)',
+        quantity: 1,
+        value: valorComTaxa,
+      }],
       externalReference: pedido_id,
     });
 
+    const linkPagamento = cob.link || cob.url || cob.invoiceUrl;
+    if (!linkPagamento) throw new Error('Checkout criado sem link de pagamento.');
+
     await supabase.from('pedidos').update({ pagarme_order_id: cob.id }).eq('id', pedido_id);
 
-    // invoiceUrl = página de pagamento hospedada pelo Asaas
-    res.json({ invoiceUrl: cob.invoiceUrl, valor: valorComTaxa });
+    // O app abre este link; o webhook confirma o pagamento pelo externalReference
+    res.json({ invoiceUrl: linkPagamento, valor: valorComTaxa });
   } catch(e) {
     console.error('Asaas Cartao Link:', e.message);
     res.status(500).json({ erro: 'Não foi possível gerar o link de pagamento. Tente novamente.' });
