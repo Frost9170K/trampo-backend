@@ -231,20 +231,43 @@ app.get('/autonomos', async (req, res) => {
   }
 
   // Busca simples por categoria / nome
-  let query = supabase
-    .from('autonomos')
-    .select('id, nome, categoria, especialidade, bairro, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo')
-    .eq('ativo', true)
-    .neq('senha_hash', 'CONTA_EXCLUIDA')   // esconde contas excluídas/anonimizadas
-    .order('nota_media', { ascending: false });
+  const CAMPOS_LISTA = 'id, nome, categoria, especialidade, bairro, cidade, atende_remoto, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo';
+  function baseQuery() {
+    let q = supabase
+      .from('autonomos')
+      .select(CAMPOS_LISTA)
+      .eq('ativo', true)
+      .neq('senha_hash', 'CONTA_EXCLUIDA');   // esconde contas excluídas/anonimizadas
+    if (categoria) q = q.eq('categoria', categoria);
+    if (busca)     q = q.ilike('nome', `%${busca}%`);
+    return q;
+  }
 
-  if (categoria) query = query.eq('categoria', categoria);
-  if (cidade)    query = query.eq('cidade', cidade);
-  if (busca)     query = query.ilike('nome', `%${busca}%`);
+  if (!cidade) {
+    const { data, error } = await baseQuery().order('nota_media', { ascending: false });
+    if (error) return res.status(500).json({ erro: error.message });
+    return res.json(data);
+  }
 
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ erro: error.message });
-  res.json(data);
+  // Com cidade: profissionais DA cidade + os que ATENDEM na cidade + os REMOTOS
+  const [locais, multiCidade, remotos] = await Promise.all([
+    baseQuery().eq('cidade', cidade),
+    baseQuery().contains('cidades_atendimento', [cidade]).neq('cidade', cidade),
+    baseQuery().eq('atende_remoto', true).neq('cidade', cidade),
+  ]);
+  const erroQ = locais.error || multiCidade.error || remotos.error;
+  if (erroQ) return res.status(500).json({ erro: erroQ.message });
+
+  // Mescla sem duplicar (um autônomo pode cair em mais de um grupo)
+  const vistos = new Set();
+  const resultado = [];
+  for (const lista of [locais.data||[], multiCidade.data||[], remotos.data||[]]) {
+    for (const a of lista) {
+      if (!vistos.has(a.id)) { vistos.add(a.id); resultado.push(a); }
+    }
+  }
+  resultado.sort((a,b) => (b.nota_media||0) - (a.nota_media||0));
+  res.json(resultado);
 });
 
 // ── Perfil público do autônomo ────────────────────────────
@@ -253,6 +276,7 @@ app.get('/autonomos/:id', async (req, res) => {
     .from('autonomos')
     .select(`
       id, nome, categoria, especialidade, bairro, bio,
+      cidade, atende_remoto, cidades_atendimento,
       nota_media, total_avaliacoes, total_servicos,
       verificado, disponibilidade, disponibilidade_dias, disponibilidade_horas, preco_medio,
       servicos ( id, nome, descricao, preco, unidade ),
@@ -372,7 +396,7 @@ app.get('/autonomos/painel/estatisticas', autenticar, async (req, res) => {
 
 // ── Atualizar perfil do autônomo ──────────────────────────
 app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
-  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas','cpf'];
+  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas','cpf','cidades_atendimento','atende_remoto'];
   const update = {};
   campos.forEach(c => { if (req.body[c] !== undefined) update[c] = req.body[c]; });
 
