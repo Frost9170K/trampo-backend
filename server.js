@@ -91,6 +91,35 @@ function autenticar(req, res, next) {
   }
 }
 
+// ── Limite de tentativas (anti força bruta) ───────────────
+// Guarda em memória por IP. Simples e sem dependência — suficiente
+// para uma instância; se um dia rodar em várias, migrar para Redis.
+const tentativas = new Map();
+const JANELA_MS  = 15 * 60 * 1000;  // 15 minutos
+const MAX_TENTATIVAS = 10;
+
+function limitarTentativas(req, res, next) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'desconhecido';
+  const agora = Date.now();
+  const reg = tentativas.get(ip);
+
+  if (!reg || agora > reg.reset) {
+    tentativas.set(ip, { count: 1, reset: agora + JANELA_MS });
+    return next();
+  }
+  reg.count++;
+  if (reg.count > MAX_TENTATIVAS) {
+    const faltam = Math.ceil((reg.reset - agora) / 60000);
+    return res.status(429).json({ erro: `Muitas tentativas. Tente novamente em ${faltam} minuto(s).` });
+  }
+  next();
+}
+// Limpeza periódica pra memória não crescer
+setInterval(() => {
+  const agora = Date.now();
+  for (const [ip, reg] of tentativas) if (agora > reg.reset) tentativas.delete(ip);
+}, 30 * 60 * 1000);
+
 // ── Validação de UUID ─────────────────────────────────────
 // Garante que IDs vindos da URL (req.params) são UUIDs válidos antes de
 // usá-los em queries — especialmente importante em filtros .or() que
@@ -155,6 +184,9 @@ app.post('/autonomos/cadastro', async (req, res) => {
           categoria, especialidade, bio, preco_medio,
           disponibilidade, lat, lng, cpf, cidade, chave_pix } = req.body;
 
+  if (senha && senha.length < 6) {
+    return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
+  }
   if (!nome || !email || !senha || !telefone || !categoria) {
     return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
   }
@@ -176,6 +208,7 @@ app.post('/autonomos/cadastro', async (req, res) => {
     .insert([{ nome, email, senha_hash, telefone, bairro,
                categoria, especialidade, bio, preco_medio,
                disponibilidade, lat, lng, localizacao,
+               ativo: true,
                ...(cpf ? { cpf } : {}),
                ...(cidade ? { cidade } : {}),
                ...(chave_pix ? { chave_pix } : {}) }])
@@ -193,7 +226,7 @@ app.post('/autonomos/cadastro', async (req, res) => {
 });
 
 // ── Login do autônomo ─────────────────────────────────────
-app.post('/autonomos/login', async (req, res) => {
+app.post('/autonomos/login', limitarTentativas, async (req, res) => {
   const { email, senha } = req.body;
   if (!email || !senha) return res.status(400).json({ erro: 'Email e senha obrigatórios.' });
 
@@ -231,7 +264,7 @@ app.get('/autonomos', async (req, res) => {
   }
 
   // Busca simples por categoria / nome
-  const CAMPOS_LISTA = 'id, nome, categoria, especialidade, bairro, cidade, atende_remoto, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo';
+  const CAMPOS_LISTA = 'id, nome, categoria, especialidade, bairro, cidade, atende_remoto, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo, foto_url';
   function baseQuery() {
     let q = supabase
       .from('autonomos')
@@ -240,7 +273,7 @@ app.get('/autonomos', async (req, res) => {
       .neq('senha_hash', 'CONTA_EXCLUIDA');   // esconde contas excluídas/anonimizadas
     if (categoria) q = q.eq('categoria', categoria);
     if (busca)     q = q.ilike('nome', `%${busca}%`);
-    return q;
+    return q.limit(300);   // teto de segurança: evita resposta gigante quando a base crescer
   }
 
   if (!cidade) {
@@ -250,18 +283,20 @@ app.get('/autonomos', async (req, res) => {
   }
 
   // Com cidade: profissionais DA cidade + os que ATENDEM na cidade + os REMOTOS
-  const [locais, multiCidade, remotos] = await Promise.all([
+  // + os SEM cidade cadastrada (fallback: não somem por dado faltante)
+  const [locais, multiCidade, remotos, semCidade] = await Promise.all([
     baseQuery().eq('cidade', cidade),
     baseQuery().contains('cidades_atendimento', [cidade]).neq('cidade', cidade),
     baseQuery().eq('atende_remoto', true).neq('cidade', cidade),
+    baseQuery().is('cidade', null),
   ]);
-  const erroQ = locais.error || multiCidade.error || remotos.error;
+  const erroQ = locais.error || multiCidade.error || remotos.error || semCidade.error;
   if (erroQ) return res.status(500).json({ erro: erroQ.message });
 
   // Mescla sem duplicar (um autônomo pode cair em mais de um grupo)
   const vistos = new Set();
   const resultado = [];
-  for (const lista of [locais.data||[], multiCidade.data||[], remotos.data||[]]) {
+  for (const lista of [locais.data||[], multiCidade.data||[], remotos.data||[], semCidade.data||[]]) {
     for (const a of lista) {
       if (!vistos.has(a.id)) { vistos.add(a.id); resultado.push(a); }
     }
@@ -396,7 +431,7 @@ app.get('/autonomos/painel/estatisticas', autenticar, async (req, res) => {
 
 // ── Atualizar perfil do autônomo ──────────────────────────
 app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
-  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas','cpf','cidades_atendimento','atende_remoto'];
+  const campos = ['telefone','bairro','bio','preco_medio','disponibilidade','ativo','especialidade','chave_pix','disponibilidade_dias','disponibilidade_horas','cpf','cidades_atendimento','atende_remoto','foto_url'];
   const update = {};
   campos.forEach(c => { if (req.body[c] !== undefined) update[c] = req.body[c]; });
 
@@ -411,8 +446,9 @@ app.put('/autonomos/painel/perfil', autenticar, async (req, res) => {
 //  USUÁRIOS (clientes)
 // ════════════════════════════════════════════════════════
 app.post('/usuarios/cadastro', async (req, res) => {
-  const { nome, email, senha, telefone, cpf } = req.body;
+  const { nome, email, senha, telefone, cpf, cidade } = req.body;
   if (!nome || !email || !senha) return res.status(400).json({ erro: 'Campos obrigatórios faltando.' });
+  if (senha.length < 6) return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
 
   const { data: existe } = await supabase
     .from('usuarios').select('id').eq('email', email).single();
@@ -421,6 +457,7 @@ app.post('/usuarios/cadastro', async (req, res) => {
   const senha_hash = await bcrypt.hash(senha, 10);
   const novoUsuario = { nome, email, senha_hash, telefone };
   if (cpf) novoUsuario.cpf = cpf; // salva o CPF já no cadastro (evita pedir de novo no pagamento)
+  if (cidade) novoUsuario.cidade = cidade;
   const { data, error } = await supabase
     .from('usuarios').insert([novoUsuario]).select('id, nome, email, telefone, cpf');
 
@@ -430,7 +467,7 @@ app.post('/usuarios/cadastro', async (req, res) => {
   res.status(201).json({ usuario: data[0], token });
 });
 
-app.post('/usuarios/login', async (req, res) => {
+app.post('/usuarios/login', limitarTentativas, async (req, res) => {
   const { email, senha } = req.body;
   const { data: usuario } = await supabase.from('usuarios').select('*').eq('email', email).single();
   if (!usuario || !(await bcrypt.compare(senha, usuario.senha_hash)))
@@ -697,6 +734,7 @@ app.patch('/pedidos/:id/concluir', autenticar, async (req, res) => {
     const { data: autonomo } = await supabase
       .from('autonomos').select('chave_pix, nome').eq('id', pedido.autonomo_id).single();
     if (autonomo) {
+      if (!autonomo.chave_pix) await avisarSemChavePix(pedido.autonomo_id, pedido.valor_servico);
       await transferirAutonomo({ ...pedido, autonomos: autonomo });
     }
   } catch(e) {
@@ -711,7 +749,7 @@ app.get('/pedidos', autenticar, async (req, res) => {
   const campo = req.usuario.tipo === 'autonomo' ? 'autonomo_id' : 'usuario_id';
   const { data, error } = await supabase
     .from('pedidos')
-    .select('*, servicos(nome), autonomos(nome, especialidade, categoria, telefone), usuarios(nome, telefone), avaliacoes(nota, comentario)')
+    .select('*, servicos(nome), autonomos(nome, especialidade, categoria, telefone), usuarios(nome, telefone, nota_media_cliente, total_avaliacoes_cliente), avaliacoes(nota, comentario), avaliacoes_clientes(nota)')
     .eq(campo, req.usuario.id)
     .order('criado_em', { ascending: false });
 
@@ -739,6 +777,44 @@ app.post('/avaliacoes', autenticar, async (req, res) => {
   }]).select();
 
   if (error) return res.status(500).json({ erro: error.message });
+  res.status(201).json({ avaliacao: data[0] });
+});
+
+// Autônomo avalia o CLIENTE (reputação de mão dupla)
+app.post('/avaliacoes-cliente', autenticar, async (req, res) => {
+  const { pedido_id, nota, comentario } = req.body;
+  if (!pedido_id || !ehUUID(pedido_id)) return res.status(400).json({ erro: 'Pedido inválido.' });
+  if (!nota || nota < 1 || nota > 5) return res.status(400).json({ erro: 'Nota deve ser entre 1 e 5.' });
+
+  const { data: pedido } = await supabase
+    .from('pedidos').select('id, status, usuario_id, autonomo_id').eq('id', pedido_id).single();
+  if (!pedido) return res.status(404).json({ erro: 'Pedido não encontrado.' });
+  if (pedido.autonomo_id !== req.usuario.id) return res.status(403).json({ erro: 'Sem permissão.' });
+  if (pedido.status !== 'concluido') return res.status(400).json({ erro: 'Só é possível avaliar pedidos concluídos.' });
+
+  const { data: jaExiste } = await supabase
+    .from('avaliacoes_clientes').select('id').eq('pedido_id', pedido_id).maybeSingle();
+  if (jaExiste) return res.status(400).json({ erro: 'Você já avaliou este cliente.' });
+
+  const { data, error } = await supabase.from('avaliacoes_clientes').insert([{
+    pedido_id, nota, comentario: comentario || null,
+    usuario_id: pedido.usuario_id, autonomo_id: pedido.autonomo_id,
+  }]).select();
+  if (error) return res.status(500).json({ erro: error.message });
+
+  // Recalcula a média do cliente
+  try {
+    const { data: todas } = await supabase
+      .from('avaliacoes_clientes').select('nota').eq('usuario_id', pedido.usuario_id);
+    if (todas?.length) {
+      const media = todas.reduce((s, a) => s + a.nota, 0) / todas.length;
+      await supabase.from('usuarios').update({
+        nota_media_cliente: parseFloat(media.toFixed(2)),
+        total_avaliacoes_cliente: todas.length,
+      }).eq('id', pedido.usuario_id);
+    }
+  } catch {}
+
   res.status(201).json({ avaliacao: data[0] });
 });
 
@@ -871,14 +947,16 @@ app.get('/conversas', autenticar, async (req, res) => {
 
   if (error) return res.status(500).json({ erro: error.message });
 
-  // Agrupar pela conversa (última mensagem de cada par)
+  // Agrupar pela conversa (última mensagem de cada par) + contar não lidas
   const conversas = {};
   (data || []).forEach(m => {
     const outroId = m.de_id === meuId ? m.para_id : m.de_id;
     if (!conversas[outroId]) {
       const outroTipo = m.de_id === meuId ? m.para_tipo : m.de_tipo;
-      conversas[outroId] = { ...m, outro_id: outroId, outro_tipo: outroTipo };
+      conversas[outroId] = { ...m, outro_id: outroId, outro_tipo: outroTipo, nao_lidas: 0 };
     }
+    // mensagens que o outro me mandou e eu ainda não abri
+    if (m.para_id === meuId && m.lida === false) conversas[outroId].nao_lidas++;
   });
 
   // Buscar o nome de cada participante (separa por tabela)
@@ -905,7 +983,7 @@ app.get('/conversas', autenticar, async (req, res) => {
 // ════════════════════════════════════════════════════════
 //  RECUPERAÇÃO DE SENHA
 // ════════════════════════════════════════════════════════
-app.post('/recuperar-senha', async (req, res) => {
+app.post('/recuperar-senha', limitarTentativas, async (req, res) => {
   const { email, tipo } = req.body;
   if (!email) return res.status(400).json({ erro: 'Email obrigatório.' });
   const tabela = tipo === 'autonomo' ? 'autonomos' : 'usuarios';
@@ -1034,6 +1112,20 @@ async function buscarOuCriarCliente(usuario) {
   if (cpfLimpo) body.cpfCnpj = cpfLimpo;
   const c = await asaasReq('POST', '/customers', body);
   return c.id;
+}
+
+// Avisa o autônomo que o pagamento está retido porque falta a chave Pix.
+// Chamado só na conclusão/liberação — o retry de 2h não notifica (evitaria spam).
+async function avisarSemChavePix(autonomoId, valor) {
+  try {
+    const { data: aut } = await supabase
+      .from('autonomos').select('push_token, chave_pix').eq('id', autonomoId).single();
+    if (aut && !aut.chave_pix && aut.push_token) {
+      enviarPush(aut.push_token, '⚠️ Cadastre sua chave Pix',
+        `Você tem ${valor ? 'R$ ' + Number(valor).toFixed(2).replace('.', ',') : 'um pagamento'} aguardando. Cadastre sua chave Pix no app para receber.`,
+        { tipo: 'sem_chave_pix' });
+    }
+  } catch {}
 }
 
 async function transferirAutonomo(pedido) {
@@ -1460,6 +1552,8 @@ async function verificarLiberacaoAutomatica() {
       // Transferir pro autônomo via Asaas
       if (pedido.autonomos?.chave_pix) {
         await transferirAutonomo({ ...pedido, autonomos: pedido.autonomos });
+      } else {
+        await avisarSemChavePix(pedido.autonomo_id, pedido.valor_servico);
       }
     }
   } catch(e) {
@@ -1625,9 +1719,10 @@ app.patch('/usuarios/atualizar-cpf', autenticar, async (req, res) => {
 
 
 app.put('/usuarios/perfil', autenticar, async (req, res) => {
-  const { nome, telefone, cpf } = req.body;
+  const { nome, telefone, cpf, foto_url } = req.body;
   const dados = { nome, telefone };
   if (cpf !== undefined) dados.cpf = cpf;
+  if (foto_url !== undefined) dados.foto_url = foto_url;
   const { error } = await supabase.from('usuarios')
     .update(dados)
     .eq('id', req.usuario.id);
@@ -1812,6 +1907,44 @@ app.get('/keep-alive', async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────
+// ── LEMBRETE DE PAGAMENTO PENDENTE ─────────────────────────
+// Pedido com horário já confirmado mas não pago há mais de 24h:
+// manda UM push de lembrete (a coluna lembrete_pagamento_em evita repetir).
+async function lembrarPagamentosPendentes() {
+  try {
+    const umDiaAtras   = new Date(Date.now() - 24*60*60*1000).toISOString();
+    const seteDiasAtras = new Date(Date.now() - 7*24*60*60*1000).toISOString();
+
+    const { data: pendentes } = await supabase
+      .from('pedidos')
+      .select('id, valor_total, data_agendada, horario_confirmado, usuarios(push_token), autonomos(nome)')
+      .eq('status', 'aguardando_pagamento')
+      .is('lembrete_pagamento_em', null)
+      .lt('criado_em', umDiaAtras)
+      .gt('criado_em', seteDiasAtras);
+
+    for (const p of pendentes || []) {
+      // marca antes de enviar — se falhar o push, não fica reenviando
+      const { error } = await supabase.from('pedidos')
+        .update({ lembrete_pagamento_em: new Date().toISOString() })
+        .eq('id', p.id)
+        .is('lembrete_pagamento_em', null);
+      if (error) continue;
+
+      try {
+        if (p.usuarios?.push_token) {
+          enviarPush(p.usuarios.push_token, '⏳ Falta pagar para agendar',
+            `${p.autonomos?.nome || 'O profissional'} já confirmou o horário. Finalize o pagamento para garantir o atendimento.`,
+            { tipo: 'lembrete_pagamento', pedido_id: p.id });
+        }
+      } catch {}
+    }
+    if ((pendentes || []).length) console.log(`🔔 Lembrete de pagamento enviado para ${pendentes.length} pedido(s)`);
+  } catch (e) {
+    console.error('Erro no lembrete de pagamento:', e.message);
+  }
+}
+
 // ── EXPIRAÇÃO AUTOMÁTICA DE PEDIDOS PARADOS ────────────────
 // Roda a cada 6 horas. Regras:
 // - aguardando_confirmacao há mais de 7 dias → expira (negociação abandonada)
@@ -1888,6 +2021,8 @@ async function expirarPedidosParados() {
 // Roda ao subir e depois a cada 6 horas
 expirarPedidosParados();
 setInterval(expirarPedidosParados, 6*60*60*1000);
+lembrarPagamentosPendentes();
+setInterval(lembrarPagamentosPendentes, 6*60*60*1000);
 
 app.listen(PORT, () => {
   console.log(`\n🟢 Trampo API rodando em http://localhost:${PORT}`);
