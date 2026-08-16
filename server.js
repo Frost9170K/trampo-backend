@@ -283,20 +283,28 @@ app.get('/autonomos', async (req, res) => {
   }
 
   // Com cidade: profissionais DA cidade + os que ATENDEM na cidade + os REMOTOS
-  // + os SEM cidade cadastrada (fallback: não somem por dado faltante)
+  // + os SEM cidade cadastrada (fallback: não somem por dado faltante).
+  // Cada query é isolada: se uma falhar (ex: coluna JSON malformada), as
+  // outras ainda retornam — a busca NUNCA quebra por causa de um grupo.
+  async function tentar(qb) {
+    try {
+      const { data, error } = await qb;
+      if (error) { console.warn('Busca parcial falhou:', error.message); return []; }
+      return data || [];
+    } catch (e) { console.warn('Busca parcial exceção:', e.message); return []; }
+  }
+
   const [locais, multiCidade, remotos, semCidade] = await Promise.all([
-    baseQuery().eq('cidade', cidade),
-    baseQuery().contains('cidades_atendimento', [cidade]).neq('cidade', cidade),
-    baseQuery().eq('atende_remoto', true).neq('cidade', cidade),
-    baseQuery().is('cidade', null),
+    tentar(baseQuery().eq('cidade', cidade)),
+    tentar(baseQuery().contains('cidades_atendimento', [cidade]).neq('cidade', cidade)),
+    tentar(baseQuery().eq('atende_remoto', true).neq('cidade', cidade)),
+    tentar(baseQuery().is('cidade', null)),
   ]);
-  const erroQ = locais.error || multiCidade.error || remotos.error || semCidade.error;
-  if (erroQ) return res.status(500).json({ erro: erroQ.message });
 
   // Mescla sem duplicar (um autônomo pode cair em mais de um grupo)
   const vistos = new Set();
   const resultado = [];
-  for (const lista of [locais.data||[], multiCidade.data||[], remotos.data||[], semCidade.data||[]]) {
+  for (const lista of [locais, multiCidade, remotos, semCidade]) {
     for (const a of lista) {
       if (!vistos.has(a.id)) { vistos.add(a.id); resultado.push(a); }
     }
