@@ -76,7 +76,7 @@ function emailRecuperacaoSenha(nome, link) {
 
 // ── Middlewares ───────────────────────────────────────────
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // 10mb: fotos de perfil vêm em base64
 app.use(express.static('public')); // serve o formulário HTML
 
 // ── Auth middleware ───────────────────────────────────────
@@ -264,7 +264,7 @@ app.get('/autonomos', async (req, res) => {
   }
 
   // Busca simples por categoria / nome
-  const CAMPOS_LISTA = 'id, nome, categoria, especialidade, bairro, cidade, atende_remoto, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo, foto_url';
+  const CAMPOS_LISTA = 'id, nome, categoria, especialidade, bairro, cidade, atende_remoto, nota_media, total_avaliacoes, verificado, preco_medio, lat, lng, disponibilidade_dias, ativo'; // foto_url fora daqui de propósito: base64 pesa; foto vem no perfil individual
   function baseQuery() {
     let q = supabase
       .from('autonomos')
